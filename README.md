@@ -25,7 +25,7 @@ Your Code ──→ Chunkers ──→ Ollama Embeddings ──→ SQLite + FTS5
 
 ```bash
 # Clone and install
-git clone https://github.com/jrussas/mcp-rag.git
+git clone https://github.com/JMRussas/mcp-rag.git
 cd mcp-rag
 pip install -r requirements.txt
 
