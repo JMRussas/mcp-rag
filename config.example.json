@@ -1,0 +1,52 @@
+{
+  "mcp": {
+    "server_name": "my-project-rag",
+    "search_tool": {
+      "name": "search_codebase",
+      "description": "Search the codebase source code and documentation."
+    },
+    "lookup_tool": {
+      "name": "lookup_type",
+      "description": "Look up a specific type or API by exact name."
+    }
+  },
+  "ollama": {
+    "host": "http://localhost:11434",
+    "embed_model": "nomic-embed-text",
+    "embed_timeout": 30.0
+  },
+  "database": {
+    "path": "data/rag.db"
+  },
+  "search": {
+    "default_top_k": 8,
+    "max_top_k": 20,
+    "embed_dimensions": 768,
+    "min_score": 0.0
+  },
+  "sources": {
+    "repos_dir": "data/repos",
+    "chunks_path": "data/chunks.jsonl"
+  },
+  "pipeline": {
+    "concurrency": 4,
+    "batch_size": 50,
+    "progress_interval": 100,
+    "max_embed_chars": 6000
+  },
+  "repos": [
+    {
+      "name": "my-source",
+      "path": "/path/to/your/source/code",
+      "type": "python",
+      "source_tag": "src"
+    },
+    {
+      "name": "my-docs",
+      "path": "/path/to/your/docs",
+      "type": "markdown",
+      "source_tag": "docs",
+      "no_recurse": false
+    }
+  ]
+}

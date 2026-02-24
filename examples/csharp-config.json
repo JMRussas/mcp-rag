@@ -1,0 +1,49 @@
+{
+  "mcp": {
+    "server_name": "engine-rag",
+    "search_tool": {
+      "name": "search_engine",
+      "description": "Search the C# game engine source code and documentation."
+    },
+    "lookup_tool": {
+      "name": "lookup_type",
+      "description": "Look up a specific C# class, struct, enum, or interface by name."
+    }
+  },
+  "ollama": {
+    "host": "http://localhost:11434",
+    "embed_model": "nomic-embed-text",
+    "embed_timeout": 30.0
+  },
+  "database": {
+    "path": "data/rag.db"
+  },
+  "search": {
+    "default_top_k": 8,
+    "max_top_k": 20,
+    "embed_dimensions": 768
+  },
+  "sources": {
+    "chunks_path": "data/chunks.jsonl"
+  },
+  "repos": [
+    {
+      "name": "engine",
+      "path": "/path/to/engine/src",
+      "type": "csharp",
+      "source_tag": "engine"
+    },
+    {
+      "name": "game",
+      "path": "/path/to/game/src",
+      "type": "csharp",
+      "source_tag": "game"
+    },
+    {
+      "name": "docs",
+      "path": "/path/to/docs",
+      "type": "markdown",
+      "source_tag": "docs"
+    }
+  ]
+}

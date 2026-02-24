@@ -1,0 +1,43 @@
+{
+  "mcp": {
+    "server_name": "myapp-rag",
+    "search_tool": {
+      "name": "search_myapp",
+      "description": "Search the myapp Python codebase and documentation."
+    },
+    "lookup_tool": {
+      "name": "lookup_myapp",
+      "description": "Look up a specific Python class or function by name."
+    }
+  },
+  "ollama": {
+    "host": "http://localhost:11434",
+    "embed_model": "nomic-embed-text",
+    "embed_timeout": 30.0
+  },
+  "database": {
+    "path": "data/rag.db"
+  },
+  "search": {
+    "default_top_k": 8,
+    "max_top_k": 20,
+    "embed_dimensions": 768
+  },
+  "sources": {
+    "chunks_path": "data/chunks.jsonl"
+  },
+  "repos": [
+    {
+      "name": "app-source",
+      "path": "/path/to/myapp/src",
+      "type": "python",
+      "source_tag": "src"
+    },
+    {
+      "name": "app-docs",
+      "path": "/path/to/myapp/docs",
+      "type": "markdown",
+      "source_tag": "docs"
+    }
+  ]
+}

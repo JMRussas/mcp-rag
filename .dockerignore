@@ -1,0 +1,12 @@
+data/
+config.json
+__pycache__/
+*.pyc
+.venv/
+venv/
+.git/
+.github/
+.ruff_cache/
+.pytest_cache/
+.vscode/
+.idea/

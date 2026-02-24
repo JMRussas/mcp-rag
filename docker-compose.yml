@@ -1,0 +1,36 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+
+  mcp-rag:
+    build: .
+    depends_on:
+      - ollama
+    volumes:
+      - ./config.json:/app/config.json:ro
+      - ./data:/app/data
+    # Wait for Ollama, pull embedding model, rebuild index, start server
+    entrypoint: >
+      python -c "
+      import httpx, time, subprocess, sys
+      print('Waiting for Ollama...')
+      while True:
+          try:
+              httpx.get('http://ollama:11434/api/tags').raise_for_status()
+              break
+          except Exception:
+              time.sleep(1)
+      print('Pulling nomic-embed-text...')
+      httpx.post('http://ollama:11434/api/pull', json={'name': 'nomic-embed-text'}, timeout=300)
+      print('Building index...')
+      subprocess.run([sys.executable, 'pipeline.py', 'rebuild'], check=True)
+      print('Starting MCP server...')
+      subprocess.run([sys.executable, 'server.py'], check=True)
+      "
+
+volumes:
+  ollama_data:

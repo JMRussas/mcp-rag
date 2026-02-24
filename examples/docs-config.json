@@ -1,0 +1,46 @@
+{
+  "mcp": {
+    "server_name": "docs-rag",
+    "search_tool": {
+      "name": "search_docs",
+      "description": "Search project documentation and guides."
+    },
+    "lookup_tool": {
+      "name": "lookup_docs",
+      "description": "Look up a specific topic in the documentation."
+    }
+  },
+  "ollama": {
+    "host": "http://localhost:11434",
+    "embed_model": "nomic-embed-text",
+    "embed_timeout": 30.0
+  },
+  "database": {
+    "path": "data/rag.db"
+  },
+  "search": {
+    "default_top_k": 8,
+    "max_top_k": 20,
+    "embed_dimensions": 768
+  },
+  "sources": {
+    "repos_dir": "data/repos",
+    "chunks_path": "data/chunks.jsonl"
+  },
+  "repos": [
+    {
+      "name": "wiki",
+      "url": "https://github.com/your-org/your-wiki.git",
+      "local_dir": "wiki",
+      "type": "markdown",
+      "source_tag": "wiki"
+    },
+    {
+      "name": "guides",
+      "path": "/path/to/local/guides",
+      "type": "markdown",
+      "source_tag": "guides",
+      "no_recurse": true
+    }
+  ]
+}
