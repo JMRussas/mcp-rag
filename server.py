@@ -330,8 +330,8 @@ def create_server(config_path: Path | None = None) -> FastMCP:
             if not safe_name:
                 return format_results([])
             rows = conn.execute(
-                f"SELECT chunks.* FROM chunks_fts JOIN chunks ON chunks.rowid = chunks_fts.rowid WHERE chunks_fts MATCH '\"{safe_name}\"' LIMIT ?",
-                (top_k,),
+                "SELECT chunks.* FROM chunks_fts JOIN chunks ON chunks.rowid = chunks_fts.rowid WHERE chunks_fts MATCH ? LIMIT ?",
+                (f'"{safe_name}"', top_k),
             ).fetchall()
         except sqlite3.OperationalError as e:
             log.warning(f"FTS5 query failed for '{name}', falling back to LIKE: {e}")

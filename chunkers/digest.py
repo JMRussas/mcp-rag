@@ -10,11 +10,14 @@
 #  Depends on: chunkers/base.py
 #  Used by:    pipeline.py (via chunker registry)
 
+import logging
 import re
 from pathlib import Path
 
 from chunkers import register_chunker
 from chunkers.base import BaseChunker, count_braces
+
+log = logging.getLogger("pipeline")
 
 # Patterns for type definitions
 TYPE_DEF_RE = re.compile(
@@ -70,7 +73,7 @@ class DigestChunker(BaseChunker):
                 source_name = sub_name.lower()
                 file_chunks = _chunk_digest_file(digest_file, source_name, base_path)
                 chunks.extend(file_chunks)
-                print(f"  [{sub_name}] {len(file_chunks)} chunks from {digest_file.name}")
+                log.info(f"  [{sub_name}] {len(file_chunks)} chunks from {digest_file.name}")
 
             if include_internal:
                 internal_file = source_dir / sub_name / f"{sub_name}Internal{extension}"
@@ -78,7 +81,7 @@ class DigestChunker(BaseChunker):
                     source_name = f"{sub_name.lower()}_internal"
                     file_chunks = _chunk_digest_file(internal_file, source_name, base_path)
                     chunks.extend(file_chunks)
-                    print(f"  [{sub_name}Internal] {len(file_chunks)} chunks")
+                    log.info(f"  [{sub_name}Internal] {len(file_chunks)} chunks")
 
         return chunks
 
@@ -91,7 +94,7 @@ class DigestChunker(BaseChunker):
             file_chunks = _chunk_digest_file(digest_file, source)
             chunks.extend(file_chunks)
 
-        print(f"  [{repo_config['name']}] {len(chunks)} chunks")
+        log.info(f"  [{repo_config['name']}] {len(chunks)} chunks")
         return chunks
 
 

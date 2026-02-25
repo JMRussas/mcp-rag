@@ -8,10 +8,13 @@
 #  Used by:    pipeline.py (via chunker registry)
 
 import ast
+import logging
 from pathlib import Path
 
 from chunkers import register_chunker
 from chunkers.base import BaseChunker, derive_category
+
+log = logging.getLogger("pipeline")
 
 
 class PythonChunker(BaseChunker):
@@ -25,7 +28,7 @@ class PythonChunker(BaseChunker):
         source_tag = repo_config.get("source_tag", "python")
 
         if not source_dir.exists():
-            print(f"  Warning: {source_dir} not found, skipping.")
+            log.warning(f"{source_dir} not found, skipping.")
             return []
 
         chunks = []
@@ -39,7 +42,7 @@ class PythonChunker(BaseChunker):
             file_chunks = _chunk_python_file(py_file, source_tag, source_dir)
             chunks.extend(file_chunks)
 
-        print(f"  [{repo_config['name']}] {len(chunks)} chunks from {len(py_files)} .py files")
+        log.info(f"  [{repo_config['name']}] {len(chunks)} chunks from {len(py_files)} .py files")
         return chunks
 
 

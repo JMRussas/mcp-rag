@@ -7,11 +7,14 @@
 #  Depends on: chunkers/base.py
 #  Used by:    pipeline.py (via chunker registry)
 
+import logging
 import re
 from pathlib import Path
 
 from chunkers import register_chunker
 from chunkers.base import BaseChunker
+
+log = logging.getLogger("pipeline")
 
 # Default directories to skip
 SKIP_DIRS = {".git", "node_modules", "__pycache__", "obj", "bin", ".venv", "venv"}
@@ -68,7 +71,7 @@ class CodeChunker(BaseChunker):
             if chunk:
                 chunks.append(chunk)
 
-        print(f"  [{repo_config['name']}] {len(chunks)} chunks")
+        log.info(f"  [{repo_config['name']}] {len(chunks)} chunks")
         return chunks
 
 

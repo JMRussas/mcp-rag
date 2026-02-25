@@ -178,11 +178,11 @@ def cmd_chunk(config: dict):
             f.write(json.dumps(chunk, ensure_ascii=False) + "\n")
 
     log.info(f"[chunk] Wrote {len(deduped)} chunks to {chunks_path}")
-    _print_source_stats(deduped)
+    _log_source_stats(deduped)
 
 
-def _print_source_stats(chunks: list[dict]):
-    """Print chunk count by source."""
+def _log_source_stats(chunks: list[dict]):
+    """Log chunk count by source."""
     from collections import Counter
 
     counts = Counter(c["source"] for c in chunks)
@@ -297,6 +297,7 @@ async def _embed_async(config: dict):
     if dim_mismatches > 0:
         log.warning(f"{dim_mismatches} chunks skipped due to dimension mismatch ({dimensions} expected)")
 
+    conn.execute("BEGIN")
     conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')")
     conn.commit()
     conn.close()

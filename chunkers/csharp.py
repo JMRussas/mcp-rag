@@ -8,11 +8,14 @@
 #  Depends on: chunkers/base.py
 #  Used by:    pipeline.py (via chunker registry)
 
+import logging
 import re
 from pathlib import Path
 
 from chunkers import register_chunker
 from chunkers.base import BaseChunker, count_braces, derive_category
+
+log = logging.getLogger("pipeline")
 
 # Top-level type declarations (handles modifiers like public, static, partial, etc.)
 TYPE_DEF_RE = re.compile(
@@ -51,7 +54,7 @@ class CSharpChunker(BaseChunker):
         source_tag = repo_config.get("source_tag", "csharp")
 
         if not source_dir.exists():
-            print(f"  Warning: {source_dir} not found, skipping.")
+            log.warning(f"{source_dir} not found, skipping.")
             return []
 
         chunks = []
@@ -66,7 +69,7 @@ class CSharpChunker(BaseChunker):
             file_chunks = _chunk_csharp_file(cs_file, source_tag, source_dir)
             chunks.extend(file_chunks)
 
-        print(f"  [{repo_config['name']}] {len(chunks)} chunks from {len(cs_files)} .cs files")
+        log.info(f"  [{repo_config['name']}] {len(chunks)} chunks from {len(cs_files)} .cs files")
         return chunks
 
 

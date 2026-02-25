@@ -6,11 +6,14 @@
 #  Depends on: chunkers/base.py
 #  Used by:    pipeline.py (via chunker registry)
 
+import logging
 import re
 from pathlib import Path
 
 from chunkers import register_chunker
 from chunkers.base import BaseChunker
+
+log = logging.getLogger("pipeline")
 
 # Headings to split on
 HEADING_RE = re.compile(r"^(#{1,3})\s+(.+)")
@@ -32,7 +35,7 @@ class MarkdownChunker(BaseChunker):
         no_recurse = repo_config.get("no_recurse", False)
 
         if not source_dir.exists():
-            print(f"  Warning: {source_dir} not found, skipping.")
+            log.warning(f"{source_dir} not found, skipping.")
             return []
 
         chunks = []
@@ -51,7 +54,7 @@ class MarkdownChunker(BaseChunker):
             file_chunks = _chunk_markdown_file(md_file, source_tag, source_dir)
             chunks.extend(file_chunks)
 
-        print(f"  [{repo_config['name']}] {len(chunks)} chunks from {source_dir.name}")
+        log.info(f"  [{repo_config['name']}] {len(chunks)} chunks from {source_dir.name}")
         return chunks
 
 
