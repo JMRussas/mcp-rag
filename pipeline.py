@@ -464,6 +464,217 @@ def cmd_stats(config: dict):
 
 
 # ---------------------------------------------------------------------------
+# Verify
+# ---------------------------------------------------------------------------
+
+
+def cmd_verify(config: dict):
+    """Verify index health and search quality.
+
+    Runs automatic checks (schema, sources, embeddings, FTS5) and
+    optional user-defined test queries from config.json "verify" section.
+    Returns exit code 0 if all checks pass, 1 if any fail.
+    """
+    asyncio.run(_verify_async(config))
+
+
+async def _verify_async(config: dict):
+    db_path = SCRIPT_DIR / config["database"]["path"]
+    if not db_path.exists():
+        log.error(f"[verify] Database not found: {db_path}")
+        log.error("[verify] Run 'rebuild' first.")
+        sys.exit(1)
+
+    dimensions = config["search"]["embed_dimensions"]
+    expected_blob_size = dimensions * 4  # float32
+
+    conn = sqlite3.connect(str(db_path))
+    passed = 0
+    failed = 0
+    warnings = 0
+
+    def check(name: str, ok: bool, detail: str = ""):
+        nonlocal passed, failed
+        if ok:
+            passed += 1
+            log.info(f"  PASS  {name}" + (f" — {detail}" if detail else ""))
+        else:
+            failed += 1
+            log.error(f"  FAIL  {name}" + (f" — {detail}" if detail else ""))
+
+    def warn(name: str, detail: str):
+        nonlocal warnings
+        warnings += 1
+        log.warning(f"  WARN  {name} — {detail}")
+
+    log.info("[verify] Running index health checks...")
+    log.info("")
+
+    # --- Schema checks ---
+    log.info("Schema:")
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    check("chunks table exists", "chunks" in tables)
+    check("chunks_fts table exists", "chunks_fts" in tables)
+
+    # Column check
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(chunks)").fetchall()}
+    expected_cols = {"id", "text", "source", "module_path", "type_name", "category", "heading", "file_path", "embedding"}
+    missing_cols = expected_cols - cols
+    check("chunks columns complete", not missing_cols, f"missing: {missing_cols}" if missing_cols else "")
+
+    # --- Content checks ---
+    log.info("")
+    log.info("Content:")
+    total = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+    check("chunks not empty", total > 0, f"{total} chunks")
+
+    # Source distribution
+    sources = conn.execute("SELECT source, COUNT(*) FROM chunks GROUP BY source ORDER BY source").fetchall()
+    for source, count in sources:
+        log.info(f"         {source}: {count}")
+
+    # Check all configured source_tags are represented
+    expected_sources = {r.get("source_tag", r["name"]) for r in config["repos"]}
+    actual_sources = {r[0] for r in sources}
+    missing_sources = expected_sources - actual_sources
+    if missing_sources:
+        warn("source coverage", f"configured sources not in DB: {missing_sources}")
+    else:
+        check("all configured sources indexed", True, f"{len(actual_sources)} sources")
+
+    # --- Embedding checks ---
+    log.info("")
+    log.info("Embeddings:")
+    null_embeddings = conn.execute("SELECT COUNT(*) FROM chunks WHERE embedding IS NULL").fetchone()[0]
+    check("no null embeddings", null_embeddings == 0, f"{null_embeddings} null" if null_embeddings else "")
+
+    # Spot-check dimensions on a sample
+    sample = conn.execute("SELECT id, LENGTH(embedding) FROM chunks WHERE embedding IS NOT NULL LIMIT 20").fetchall()
+    bad_dims = [(cid, blen) for cid, blen in sample if blen != expected_blob_size]
+    check(
+        f"embedding dimensions ({dimensions}d = {expected_blob_size} bytes)",
+        not bad_dims,
+        f"{len(bad_dims)} mismatched: {bad_dims[:3]}" if bad_dims else f"checked {len(sample)} samples",
+    )
+
+    # --- FTS5 integrity ---
+    log.info("")
+    log.info("FTS5:")
+    try:
+        fts_count = conn.execute(
+            "SELECT COUNT(*) FROM chunks_fts"
+        ).fetchone()[0]
+        check("FTS5 populated", fts_count > 0, f"{fts_count} entries")
+        check("FTS5 matches chunks", fts_count == total, f"FTS5={fts_count} vs chunks={total}")
+    except sqlite3.OperationalError as e:
+        check("FTS5 readable", False, str(e))
+
+    # --- Search quality (requires Ollama) ---
+    verify_config = config.get("verify", {})
+    test_queries = verify_config.get("queries", [])
+
+    if test_queries:
+        log.info("")
+        log.info("Search quality:")
+
+        ollama_host = config["ollama"]["host"]
+        embed_model = config["ollama"]["embed_model"]
+        embed_timeout = config["ollama"].get("embed_timeout", 30.0)
+
+        # Load embeddings for similarity search
+        import numpy as np
+
+        rows = conn.execute("SELECT id, embedding FROM chunks WHERE embedding IS NOT NULL").fetchall()
+        chunk_ids = [r[0] for r in rows]
+        embeddings = np.array(
+            [struct.unpack(f"{dimensions}f", r[1]) for r in rows],
+            dtype=np.float32,
+        )
+
+        # Pre-load metadata for filtering
+        meta_rows = conn.execute("SELECT id, source, module_path, type_name FROM chunks").fetchall()
+        meta_by_id = {r[0]: {"source": r[1], "module_path": r[2], "type_name": r[3]} for r in meta_rows}
+
+        async with httpx.AsyncClient(timeout=embed_timeout) as client:
+            for tq in test_queries:
+                min_results = tq.get("min_results", 1)
+
+                if "query" in tq:
+                    # Semantic search test
+                    query_text = tq["query"]
+                    try:
+                        resp = await client.post(
+                            f"{ollama_host}/api/embeddings",
+                            json={"model": embed_model, "prompt": f"search_query: {query_text}"},
+                        )
+                        resp.raise_for_status()
+                        query_vec = np.array(resp.json()["embedding"], dtype=np.float32)
+                        # Normalize
+                        norm = np.linalg.norm(query_vec)
+                        if norm > 0:
+                            query_vec /= norm
+
+                        similarities = embeddings @ query_vec
+                        top_k = min(tq.get("top_k", 5), len(chunk_ids))
+                        top_indices = np.argsort(similarities)[-top_k:][::-1]
+
+                        results = []
+                        for idx in top_indices:
+                            cid = chunk_ids[idx]
+                            score = float(similarities[idx])
+                            meta = meta_by_id.get(cid, {})
+                            results.append({"id": cid, "score": score, **meta})
+
+                        # Apply filters
+                        if tq.get("expect_source"):
+                            results = [r for r in results if r.get("source") == tq["expect_source"]]
+
+                        check(
+                            f"search \"{query_text}\"",
+                            len(results) >= min_results,
+                            f"{len(results)} results (need {min_results}), "
+                            f"top: {results[0]['id']} ({results[0]['score']:.3f})" if results else "no results",
+                        )
+                    except httpx.ConnectError:
+                        warn(f"search \"{query_text}\"", "Ollama not reachable — skipping search tests")
+                        break
+                    except Exception as e:
+                        check(f"search \"{query_text}\"", False, str(e))
+
+                elif "lookup" in tq:
+                    # Keyword lookup test
+                    name = tq["lookup"]
+                    rows = conn.execute(
+                        "SELECT id, source, type_name FROM chunks WHERE type_name = ? LIMIT 5",
+                        (name,),
+                    ).fetchall()
+                    if not rows:
+                        # Fallback to LIKE
+                        safe = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                        rows = conn.execute(
+                            "SELECT id, source, type_name FROM chunks WHERE type_name LIKE ? ESCAPE '\\' LIMIT 5",
+                            (f"%{safe}%",),
+                        ).fetchall()
+
+                    check(
+                        f"lookup \"{name}\"",
+                        len(rows) >= min_results,
+                        f"{len(rows)} results" + (f", first: {rows[0][0]}" if rows else ""),
+                    )
+
+    conn.close()
+
+    # --- Summary ---
+    log.info("")
+    total_checks = passed + failed
+    if failed == 0:
+        log.info(f"[verify] ALL PASSED ({passed} checks, {warnings} warnings)")
+    else:
+        log.error(f"[verify] {failed} FAILED / {passed} passed / {warnings} warnings")
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -476,7 +687,7 @@ def main():
 
     if len(sys.argv) < 2:
         print("Usage: python pipeline.py <command>")
-        print("Commands: clone, chunk, embed, rebuild, stats")
+        print("Commands: clone, chunk, embed, rebuild, stats, verify")
         sys.exit(1)
 
     command = sys.argv[1]
@@ -494,9 +705,11 @@ def main():
         cmd_embed(config)
     elif command == "stats":
         cmd_stats(config)
+    elif command == "verify":
+        cmd_verify(config)
     else:
         log.error(f"Unknown command: {command}")
-        print("Commands: clone, chunk, embed, rebuild, stats")
+        print("Commands: clone, chunk, embed, rebuild, stats, verify")
         sys.exit(1)
 
 

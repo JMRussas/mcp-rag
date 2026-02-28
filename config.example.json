@@ -42,6 +42,12 @@
     "progress_interval": 100,
     "max_embed_chars": 6000
   },
+  "verify": {
+    "queries": [
+      {"query": "how to create a class", "min_results": 1},
+      {"lookup": "Application", "min_results": 1}
+    ]
+  },
   "repos": [
     {
       "name": "my-source",
