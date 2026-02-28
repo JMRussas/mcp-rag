@@ -207,6 +207,12 @@ mcp-rag/
 └── .github/workflows/     CI (lint + test)
 ```
 
+## Development
+
+Built as part of a local AI development infrastructure, extracted and open-sourced as a standalone tool. Development uses a structured review process — each commit addresses specific findings from code review passes (SQL injection safety, transaction correctness, logging hygiene). 61 tests with CI running lint ([ruff](https://github.com/astral-sh/ruff)) and pytest on every push.
+
+See [commit history](https://github.com/JMRussas/mcp-rag/commits/main) for the review-driven development trail.
+
 ## Limitations
 
 - All embeddings loaded into memory at startup — practical up to ~50k chunks (~150 MB)
