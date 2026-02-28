@@ -595,12 +595,16 @@ async def _verify_async(config: dict):
         meta_rows = conn.execute("SELECT id, source, module_path, type_name FROM chunks").fetchall()
         meta_by_id = {r[0]: {"source": r[1], "module_path": r[2], "type_name": r[3]} for r in meta_rows}
 
+        ollama_available = True
+
         async with httpx.AsyncClient(timeout=embed_timeout) as client:
             for tq in test_queries:
                 min_results = tq.get("min_results", 1)
 
                 if "query" in tq:
-                    # Semantic search test
+                    # Semantic search test (requires Ollama)
+                    if not ollama_available:
+                        continue
                     query_text = tq["query"]
                     try:
                         resp = await client.post(
@@ -636,30 +640,30 @@ async def _verify_async(config: dict):
                             f"top: {results[0]['id']} ({results[0]['score']:.3f})" if results else "no results",
                         )
                     except httpx.ConnectError:
-                        warn(f"search \"{query_text}\"", "Ollama not reachable — skipping search tests")
-                        break
+                        warn(f"search \"{query_text}\"", "Ollama not reachable — skipping semantic tests")
+                        ollama_available = False
                     except Exception as e:
                         check(f"search \"{query_text}\"", False, str(e))
 
                 elif "lookup" in tq:
-                    # Keyword lookup test
+                    # Keyword lookup test (pure SQLite, no Ollama needed)
                     name = tq["lookup"]
-                    rows = conn.execute(
+                    lookup_rows = conn.execute(
                         "SELECT id, source, type_name FROM chunks WHERE type_name = ? LIMIT 5",
                         (name,),
                     ).fetchall()
-                    if not rows:
+                    if not lookup_rows:
                         # Fallback to LIKE
                         safe = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-                        rows = conn.execute(
+                        lookup_rows = conn.execute(
                             "SELECT id, source, type_name FROM chunks WHERE type_name LIKE ? ESCAPE '\\' LIMIT 5",
                             (f"%{safe}%",),
                         ).fetchall()
 
                     check(
                         f"lookup \"{name}\"",
-                        len(rows) >= min_results,
-                        f"{len(rows)} results" + (f", first: {rows[0][0]}" if rows else ""),
+                        len(lookup_rows) >= min_results,
+                        f"{len(lookup_rows)} results" + (f", first: {lookup_rows[0][0]}" if lookup_rows else ""),
                     )
 
     conn.close()
