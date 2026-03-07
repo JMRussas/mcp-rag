@@ -40,6 +40,7 @@ python server.py                      # Start MCP server (stdio transport)
 ## Conventions
 
 - **Chunk format:** Every chunker returns dicts with keys: `id`, `text`, `source`, `module_path`, `type_name`, `category`, `heading`, `file_path`
+- **Database sources:** `db_sources` in config pulls chunks from SQLite databases via SQL queries. Column mapping is config-driven (`text_column`, `heading_column`, etc.). DB sources produce chunks in the same format as file-based chunkers — everything downstream (embed, search, verify) works unchanged.
 - **Chunker registration:** Each chunker calls `register_chunker("name", ClassName)` at module level
 - **Config-driven tools:** MCP tool names and descriptions come from `config.json`, not code
 - **Embedding prefix:** Documents get `"search_document: "`, queries get `"search_query: "` (nomic-embed-text convention)

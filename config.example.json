@@ -25,7 +25,12 @@
     "min_score": 0.0,
     "hybrid": false,
     "retrieval_depth": 20,
-    "rrf_k": 60
+    "rrf_k": 60,
+    "confidence": {
+      "high": 0.85,
+      "medium": 0.65
+    },
+    "exclude_low_confidence": false
   },
   "reranker": {
     "enabled": false,
@@ -34,7 +39,8 @@
   },
   "sources": {
     "repos_dir": "data/repos",
-    "chunks_path": "data/chunks.jsonl"
+    "chunks_path": "data/chunks.jsonl",
+    "ingest_path": "data/ingest.jsonl"
   },
   "pipeline": {
     "concurrency": 4,
@@ -61,6 +67,19 @@
       "type": "markdown",
       "source_tag": "docs",
       "no_recurse": false
+    }
+  ],
+  "db_sources": [
+    {
+      "name": "coding-standards",
+      "type": "sqlite",
+      "path": "/path/to/standards.db",
+      "query": "SELECT id, title, body, category FROM standards",
+      "text_column": "body",
+      "id_column": "id",
+      "heading_column": "title",
+      "category_column": "category",
+      "source_tag": "standards"
     }
   ]
 }
