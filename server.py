@@ -8,6 +8,9 @@
 #  Tool names, descriptions, and server identity are all config-driven,
 #  so one codebase serves any project.
 #
+#  Supports hybrid search (BM25 + vector via RRF) and optional
+#  cross-encoder reranking, both config-gated.
+#
 #  Depends on: config.json, data/*.db, numpy, httpx, mcp
 #  Used by:    MCP clients (registered via `claude mcp add`)
 
@@ -44,6 +47,26 @@ def _sanitize_fts(query: str) -> str:
     result = query.replace('"', "").replace("*", "").replace("^", "")
     result = result.lstrip("+-")
     return result.strip()
+
+
+def _rrf_fuse(ranked_lists: list[list[str]], k: int = 60) -> list[tuple[str, float]]:
+    """Reciprocal Rank Fusion across multiple ranked ID lists.
+
+    Combines rankings from different retrieval methods (e.g. vector + BM25)
+    without requiring score normalization. Higher RRF score = better.
+
+    Args:
+        ranked_lists: List of ranked ID lists (best-first).
+        k: RRF constant (default 60, standard value from the paper).
+
+    Returns:
+        List of (chunk_id, rrf_score) tuples, sorted by score descending.
+    """
+    scores: dict[str, float] = {}
+    for ranked in ranked_lists:
+        for rank, doc_id in enumerate(ranked):
+            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank + 1)
+    return sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
 
 def format_results(rows: list, scores: dict[str, float] | None = None) -> str:
@@ -113,6 +136,11 @@ def create_server(config_path: Path | None = None) -> FastMCP:
     default_top_k = config["search"]["default_top_k"]
     max_top_k = config["search"]["max_top_k"]
     min_score = config["search"].get("min_score", 0.0)
+    hybrid_enabled = config["search"].get("hybrid", False)
+    retrieval_depth = config["search"].get("retrieval_depth", 20)
+    rrf_k = config["search"].get("rrf_k", 60)
+    reranker_config = config.get("reranker", {})
+    reranker_enabled = reranker_config.get("enabled", False)
     db_path = SCRIPT_DIR / config["database"]["path"]
 
     mcp_server = FastMCP(server_name)
@@ -242,52 +270,74 @@ def create_server(config_path: Path | None = None) -> FastMCP:
             return "Error: Database not loaded. Run 'python pipeline.py rebuild' first."
 
         top_k = min(max(1, top_k), max_top_k)
+        depth = retrieval_depth if hybrid_enabled else top_k
 
         query_vec = await get_query_embedding(query)
         if query_vec is None:
             return "Error: Failed to generate query embedding. Is Ollama running?"
 
-        # Cosine similarity (embeddings are pre-normalized)
+        # --- Vector retrieval ---
         similarities = embeddings @ query_vec
 
         # Apply filters using pre-loaded metadata (vectorized where possible)
+        filter_mask = None
         if source_filter or module_filter:
-            mask = np.ones(len(chunk_ids), dtype=bool)
+            filter_mask = np.ones(len(chunk_ids), dtype=bool)
             if source_filter:
-                mask &= chunk_sources == source_filter
+                filter_mask &= chunk_sources == source_filter
             if module_filter:
                 module_filter_lower = module_filter.lower()
-                mask &= np.array([module_filter_lower in m for m in chunk_modules])
-            similarities[~mask] = -1
+                filter_mask &= np.array([module_filter_lower in m for m in chunk_modules])
+            similarities[~filter_mask] = -1
 
-        # Get top-k indices
-        top_indices = np.argsort(similarities)[::-1][:top_k]
+        top_indices = np.argsort(similarities)[::-1][:depth]
+        vector_ranked = [
+            chunk_ids[idx] for idx in top_indices
+            if similarities[idx] >= min_score
+        ]
 
-        # Collect qualifying IDs in ranked order
-        ranked_ids = []
-        result_scores = {}
-        for idx in top_indices:
-            if similarities[idx] < min_score:
-                continue
-            chunk_id = chunk_ids[idx]
-            ranked_ids.append(chunk_id)
-            result_scores[chunk_id] = float(similarities[idx])
+        # --- BM25 retrieval (hybrid mode) ---
+        if hybrid_enabled:
+            bm25_ranked = _bm25_retrieve(
+                conn, query, depth * 2, source_filter, module_filter,
+                chunk_ids, chunk_sources, chunk_modules, filter_mask,
+            )
+            # Fuse with RRF
+            fused = _rrf_fuse([vector_ranked, bm25_ranked], k=rrf_k)
+            ranked_ids = [doc_id for doc_id, _ in fused[:depth]]
+            result_scores = {doc_id: score for doc_id, score in fused[:depth]}
+        else:
+            ranked_ids = vector_ranked[:top_k]
+            result_scores = {chunk_ids[idx]: float(similarities[idx]) for idx in top_indices
+                             if chunk_ids[idx] in ranked_ids}
 
         if not ranked_ids:
             return format_results([])
 
-        # Single batch query instead of N individual queries
+        # Fetch full rows
         placeholders = ",".join("?" for _ in ranked_ids)
         rows = conn.execute(
             f"SELECT * FROM chunks WHERE id IN ({placeholders})",
             ranked_ids,
         ).fetchall()
-
-        # Re-order to match similarity ranking
         row_map = {row["id"]: row for row in rows}
         results = [row_map[cid] for cid in ranked_ids if cid in row_map]
 
-        return format_results(results, result_scores)
+        # --- Reranking (optional) ---
+        if reranker_enabled and len(results) > 1:
+            try:
+                from reranker import rerank
+                results = rerank(query, results, config)
+                # Reassign scores based on reranked order
+                result_scores = {r["id"]: 1.0 / (i + 1) for i, r in enumerate(results)}
+            except Exception as e:
+                log.warning(f"Reranker failed, using original ranking: {e}")
+
+        # Apply final top_k
+        results = results[:top_k]
+        final_scores = {r["id"]: result_scores.get(r["id"], 0.0) for r in results}
+
+        return format_results(results, final_scores)
 
     @mcp_server.tool(name=lookup_name, description=lookup_desc)
     async def lookup(
@@ -342,6 +392,59 @@ def create_server(config_path: Path | None = None) -> FastMCP:
             ).fetchall()
 
         return format_results(rows)
+
+    def _bm25_retrieve(
+        db_conn: sqlite3.Connection,
+        query: str,
+        limit: int,
+        source_filter: str,
+        module_filter: str,
+        all_chunk_ids: list[str],
+        all_chunk_sources: np.ndarray,
+        all_chunk_modules: list[str],
+        precomputed_mask: np.ndarray | None,
+    ) -> list[str]:
+        """Retrieve chunk IDs ranked by BM25 relevance via FTS5.
+
+        Filters are applied post-query in Python (consistent with vector path).
+        Returns a ranked list of chunk IDs (best-first).
+        """
+        safe_query = _sanitize_fts(query)
+        if not safe_query:
+            return []
+
+        try:
+            # FTS5 bm25() returns negative scores (lower = better match)
+            bm25_rows = db_conn.execute(
+                """SELECT chunks.id, bm25(chunks_fts) as bm25_score
+                   FROM chunks_fts
+                   JOIN chunks ON chunks.rowid = chunks_fts.rowid
+                   WHERE chunks_fts MATCH ?
+                   ORDER BY bm25(chunks_fts)
+                   LIMIT ?""",
+                (f'"{safe_query}"', limit),
+            ).fetchall()
+        except sqlite3.OperationalError as e:
+            log.warning(f"BM25 query failed: {e}")
+            return []
+
+        if not bm25_rows:
+            return []
+
+        # Build ID-to-index lookup for filter checking
+        if source_filter or module_filter:
+            id_to_idx = {cid: i for i, cid in enumerate(all_chunk_ids)}
+            filtered = []
+            for row in bm25_rows:
+                idx = id_to_idx.get(row[0])
+                if idx is None:
+                    continue
+                if precomputed_mask is not None and not precomputed_mask[idx]:
+                    continue
+                filtered.append(row[0])
+            return filtered
+        else:
+            return [row[0] for row in bm25_rows]
 
     return mcp_server
 

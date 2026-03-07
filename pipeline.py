@@ -155,6 +155,10 @@ def cmd_chunk(config: dict):
             log.warning(f"No path or local_dir for {repo['name']}, skipping.")
             continue
 
+        # Allow diving into a subdirectory (e.g. "Modules/FortniteGame")
+        if repo.get("source_subdir"):
+            source_dir = source_dir / repo["source_subdir"]
+
         try:
             chunker = get_chunker(chunker_type)
         except ValueError as e:
