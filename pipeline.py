@@ -1031,16 +1031,21 @@ def cmd_stale(config: dict):
                     # Check upstream for unpulled commits (git repos only)
                     if repo.get("url"):
                         try:
-                            fetch_result = subprocess.run(
+                            # Fetch remote refs without downloading objects
+                            subprocess.run(
                                 ["git", "-C", str(repo_dir), "fetch", "--dry-run"],
-                                capture_output=True,
-                                text=True,
-                                timeout=30,
+                                capture_output=True, text=True, timeout=30,
                             )
-                            # Non-empty stderr means there are upstream changes
-                            if fetch_result.stderr.strip():
-                                upstream_behind.append(name)
-                                log.info(f"[stale] Repo '{name}': upstream has new commits")
+                            # Compare local HEAD to remote tracking branch
+                            remote_result = subprocess.run(
+                                ["git", "-C", str(repo_dir), "rev-parse", "@{u}"],
+                                capture_output=True, text=True, timeout=10,
+                            )
+                            if remote_result.returncode == 0:
+                                remote_head = remote_result.stdout.strip()
+                                if remote_head != current_commit:
+                                    upstream_behind.append(name)
+                                    log.info(f"[stale] Repo '{name}': upstream has new commits")
                         except (subprocess.TimeoutExpired, OSError):
                             pass  # Network check is best-effort
             else:
@@ -1394,7 +1399,7 @@ async def _ingest_async(config: dict):
 # ---------------------------------------------------------------------------
 
 
-def cmd_gotcha(config: dict):
+def cmd_gotcha(config: dict, chunk_id: str, gotcha_text: str):
     """Add or update a gotcha note on an existing chunk.
 
     Usage: python pipeline.py gotcha <chunk_id> "gotcha text"
@@ -1402,12 +1407,6 @@ def cmd_gotcha(config: dict):
     Gotcha notes are anti-hallucination annotations displayed alongside
     search results to warn about common misdiagnoses.
     """
-    if len(sys.argv) < 4:
-        print('Usage: python pipeline.py gotcha <chunk_id> "gotcha text"')
-        sys.exit(1)
-
-    chunk_id = sys.argv[2]
-    gotcha_text = sys.argv[3]
     db_path = SCRIPT_DIR / config["database"]["path"]
 
     if not db_path.exists():
@@ -1470,7 +1469,10 @@ def main():
     elif command == "ingest":
         cmd_ingest(config)
     elif command == "gotcha":
-        cmd_gotcha(config)
+        if len(sys.argv) < 4:
+            print('Usage: python pipeline.py gotcha <chunk_id> "gotcha text"')
+            sys.exit(1)
+        cmd_gotcha(config, sys.argv[2], sys.argv[3])
     else:
         log.error(f"Unknown command: {command}")
         print(f"Commands: {commands}")

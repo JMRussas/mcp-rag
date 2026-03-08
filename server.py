@@ -400,8 +400,11 @@ def create_server(config_path: Path | None = None) -> FastMCP:
         final_scores = {r["id"]: result_scores.get(r["id"], 0.0) for r in results}
 
         # Classify confidence tiers (thresholds depend on score range)
-        if reranker_enabled or hybrid_enabled:
-            # RRF/reranker scores are not cosine similarities — use rank-calibrated thresholds
+        if reranker_enabled:
+            # Reranker scores are 1/(rank+1): top-1=1.0, top-3=0.33, top-10=0.1
+            tier_high, tier_med = 0.25, 0.08
+        elif hybrid_enabled:
+            # RRF scores are 1/(k+rank+1) where k=60: much smaller range
             tier_high, tier_med = _rrf_confidence_thresholds(rrf_k)
         else:
             tier_high, tier_med = confidence_high, confidence_medium
