@@ -69,8 +69,39 @@ def _rrf_fuse(ranked_lists: list[list[str]], k: int = 60) -> list[tuple[str, flo
     return sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
 
-def format_results(rows: list, scores: dict[str, float] | None = None) -> str:
-    """Format search results as readable text."""
+def _confidence_tier(score: float, high_thresh: float, med_thresh: float) -> str:
+    """Classify a similarity score into a confidence tier."""
+    if score >= high_thresh:
+        return "HIGH"
+    if score >= med_thresh:
+        return "MEDIUM"
+    return "LOW"
+
+
+def _get_gotcha(row) -> str:
+    """Safely extract gotcha text from a database row.
+
+    Returns empty string if the column doesn't exist (old DBs without
+    the gotcha column).
+    """
+    try:
+        return row["gotcha"] or ""
+    except (IndexError, KeyError):
+        return ""
+
+
+def format_results(
+    rows: list,
+    scores: dict[str, float] | None = None,
+    confidence: dict[str, str] | None = None,
+) -> str:
+    """Format search results as readable text.
+
+    Args:
+        rows: Database rows to format.
+        scores: Optional chunk_id → similarity score mapping.
+        confidence: Optional chunk_id → confidence tier mapping.
+    """
     if not rows:
         return "No results found."
 
@@ -92,10 +123,21 @@ def format_results(rows: list, scores: dict[str, float] | None = None) -> str:
 
         score_str = ""
         if scores and row["id"] in scores:
-            score_str = f" (score: {scores[row['id']]:.3f})"
+            score_val = scores[row["id"]]
+            tier_str = ""
+            if confidence and row["id"] in confidence:
+                tier_str = f", confidence: {confidence[row['id']]}"
+            score_str = f" (score: {score_val:.3f}{tier_str})"
 
         header = " | ".join(header_parts)
-        parts.append(f"--- [{header}]{score_str} ---\n{row['text']}")
+        text = row["text"]
+
+        # Append gotcha warning if present
+        gotcha = _get_gotcha(row)
+        if gotcha:
+            text += f"\n[CAUTION: {gotcha}]"
+
+        parts.append(f"--- [{header}]{score_str} ---\n{text}")
 
     return "\n\n".join(parts)
 
@@ -141,6 +183,10 @@ def create_server(config_path: Path | None = None) -> FastMCP:
     rrf_k = config["search"].get("rrf_k", 60)
     reranker_config = config.get("reranker", {})
     reranker_enabled = reranker_config.get("enabled", False)
+    confidence_config = config["search"].get("confidence", {})
+    confidence_high = confidence_config.get("high", 0.85)
+    confidence_medium = confidence_config.get("medium", 0.65)
+    exclude_low = config["search"].get("exclude_low_confidence", False)
     db_path = SCRIPT_DIR / config["database"]["path"]
 
     mcp_server = FastMCP(server_name)
@@ -337,7 +383,23 @@ def create_server(config_path: Path | None = None) -> FastMCP:
         results = results[:top_k]
         final_scores = {r["id"]: result_scores.get(r["id"], 0.0) for r in results}
 
-        return format_results(results, final_scores)
+        # Classify confidence tiers
+        tiers = {
+            r["id"]: _confidence_tier(final_scores.get(r["id"], 0.0), confidence_high, confidence_medium)
+            for r in results
+        }
+
+        # Filter low-confidence results if configured
+        if exclude_low:
+            pre_filter_count = len(results)
+            results = [r for r in results if tiers.get(r["id"]) != "LOW"]
+            final_scores = {r["id"]: final_scores[r["id"]] for r in results}
+            excluded = pre_filter_count - len(results)
+            if not results and excluded > 0:
+                return f"No high-confidence results found. {excluded} low-confidence matches were excluded."
+            tiers = {r["id"]: tiers[r["id"]] for r in results}
+
+        return format_results(results, final_scores, tiers)
 
     @mcp_server.tool(name=lookup_name, description=lookup_desc)
     async def lookup(

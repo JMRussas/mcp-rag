@@ -19,6 +19,10 @@ MCP_RAG_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 DEFAULT_FORKS=(
     "$HOME/Git/noz-rag"
     "$HOME/Git/verse-rag"
+    "$HOME/Git/diagnostic-rag"
+    "$HOME/Git/gamedesign-rag"
+    "$HOME/Git/uiux-rag"
+    "$HOME/Git/animation-rag"
 )
 
 # Files to sync (relative to project root)
