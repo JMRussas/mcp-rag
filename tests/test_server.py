@@ -1,8 +1,9 @@
 #  mcp-rag - Server Tests
 #
-#  Tests for result formatting, LIKE escaping, and search filtering.
+#  Tests for result formatting, LIKE escaping, search filtering,
+#  confidence tiers, and gotcha display.
 
-from server import _escape_like, _sanitize_fts, format_results
+from server import _confidence_tier, _escape_like, _get_gotcha, _sanitize_fts, format_results
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -153,3 +154,87 @@ def test_sanitize_fts_normal_text_unchanged():
 def test_sanitize_fts_empty_after_strip():
     """String that becomes empty after sanitization returns empty."""
     assert _sanitize_fts('"*"') == ""
+
+
+# ---------------------------------------------------------------------------
+# _confidence_tier tests
+# ---------------------------------------------------------------------------
+
+
+def test_confidence_tier_high():
+    """Score at or above high threshold is HIGH."""
+    assert _confidence_tier(0.90, 0.85, 0.65) == "HIGH"
+    assert _confidence_tier(0.85, 0.85, 0.65) == "HIGH"
+
+
+def test_confidence_tier_medium():
+    """Score between medium and high thresholds is MEDIUM."""
+    assert _confidence_tier(0.75, 0.85, 0.65) == "MEDIUM"
+    assert _confidence_tier(0.65, 0.85, 0.65) == "MEDIUM"
+
+
+def test_confidence_tier_low():
+    """Score below medium threshold is LOW."""
+    assert _confidence_tier(0.50, 0.85, 0.65) == "LOW"
+    assert _confidence_tier(0.64, 0.85, 0.65) == "LOW"
+
+
+# ---------------------------------------------------------------------------
+# format_results with confidence and gotcha
+# ---------------------------------------------------------------------------
+
+
+def test_format_results_with_confidence():
+    """Confidence tier is shown alongside score."""
+    row = _row(id="test:1")
+    result = format_results(
+        [row],
+        scores={"test:1": 0.876},
+        confidence={"test:1": "HIGH"},
+    )
+    assert "score: 0.876, confidence: HIGH" in result
+
+
+def test_format_results_with_gotcha():
+    """Gotcha text is appended as CAUTION."""
+    row = _row(id="test:1", gotcha="Not a timeout — DNS failure")
+    result = format_results([row])
+    assert "[CAUTION: Not a timeout — DNS failure]" in result
+
+
+def test_format_results_empty_gotcha_no_caution():
+    """Empty gotcha field does not produce a CAUTION line."""
+    row = _row(id="test:1", gotcha="")
+    result = format_results([row])
+    assert "CAUTION" not in result
+
+
+def test_format_results_no_gotcha_key():
+    """Row without gotcha key does not produce a CAUTION line."""
+    row = _row(id="test:1")
+    # DictRow without 'gotcha' key
+    result = format_results([row])
+    assert "CAUTION" not in result
+
+
+# ---------------------------------------------------------------------------
+# _get_gotcha tests
+# ---------------------------------------------------------------------------
+
+
+def test_get_gotcha_present():
+    """Returns gotcha text when key exists."""
+    row = DictRow({"gotcha": "warning text"})
+    assert _get_gotcha(row) == "warning text"
+
+
+def test_get_gotcha_missing_key():
+    """Returns empty string when key doesn't exist."""
+    row = DictRow({"id": "test:1"})
+    assert _get_gotcha(row) == ""
+
+
+def test_get_gotcha_none_value():
+    """Returns empty string when value is None."""
+    row = DictRow({"gotcha": None})
+    assert _get_gotcha(row) == ""

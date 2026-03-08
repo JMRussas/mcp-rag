@@ -20,6 +20,11 @@ python server.py                      # Start MCP server (stdio transport)
 | `python pipeline.py embed` | Generate embeddings, build SQLite DB |
 | `python pipeline.py rebuild` | clone + chunk + embed |
 | `python pipeline.py stats` | Print database statistics |
+| `python pipeline.py verify` | Run search quality checks |
+| `python pipeline.py stale` | Check for stale chunks (local + upstream) |
+| `python pipeline.py freshness` | Unified freshness report (age, model, sources) |
+| `python pipeline.py ingest` | Incrementally ingest new chunks |
+| `python pipeline.py gotcha` | Tag chunks with known gotchas |
 
 ## Project Structure
 
@@ -40,6 +45,7 @@ python server.py                      # Start MCP server (stdio transport)
 ## Conventions
 
 - **Chunk format:** Every chunker returns dicts with keys: `id`, `text`, `source`, `module_path`, `type_name`, `category`, `heading`, `file_path`
+- **Database sources:** `db_sources` in config pulls chunks from SQLite databases via SQL queries. Column mapping is config-driven (`text_column`, `heading_column`, etc.). DB sources produce chunks in the same format as file-based chunkers — everything downstream (embed, search, verify) works unchanged.
 - **Chunker registration:** Each chunker calls `register_chunker("name", ClassName)` at module level
 - **Config-driven tools:** MCP tool names and descriptions come from `config.json`, not code
 - **Embedding prefix:** Documents get `"search_document: "`, queries get `"search_query: "` (nomic-embed-text convention)
@@ -53,3 +59,4 @@ python server.py                      # Start MCP server (stdio transport)
 - **Logging:** Both `pipeline.py` and `server.py` use Python's `logging` module with module-level loggers (`log = logging.getLogger(...)`). Pipeline configures logging in `main()`. Server logs to stderr (MCP uses stdout for protocol). CLI usage/help text stays as `print()`.
 - **Transaction batching:** Pipeline wraps each embedding batch in an explicit `BEGIN`/`COMMIT` transaction. Uses `isolation_level=None` for manual control.
 - **Git timeouts:** Clone and pull operations have a 120-second timeout to prevent hung pipelines
+- **Index metadata:** `index_metadata` table stores `indexed_at`, `embed_model`, `embed_dimensions`, and `repo:<name>:commit` for provenance tracking. `cmd_stale` and `cmd_freshness` use this to detect model drift and upstream changes.

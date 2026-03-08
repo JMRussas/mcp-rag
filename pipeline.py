@@ -11,12 +11,14 @@
 #  Used by:    Manual CLI invocation (python pipeline.py rebuild)
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import shutil
 import sqlite3
 import struct
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -54,7 +56,7 @@ def _validate_config(config: dict):
 
     Raises ConfigError on invalid config.
     """
-    required_sections = ["ollama", "database", "search", "sources", "repos"]
+    required_sections = ["ollama", "database", "search", "sources"]
     for section in required_sections:
         if section not in config:
             raise ConfigError(f"config.json missing required section '{section}'.")
@@ -66,16 +68,27 @@ def _validate_config(config: dict):
     if not isinstance(dims, int) or dims <= 0:
         raise ConfigError("config.json 'search.embed_dimensions' must be a positive integer.")
 
-    if not isinstance(config["repos"], list) or len(config["repos"]) == 0:
-        raise ConfigError("config.json 'repos' must be a non-empty list.")
+    has_repos = isinstance(config.get("repos"), list) and len(config["repos"]) > 0
+    has_db_sources = isinstance(config.get("db_sources"), list) and len(config["db_sources"]) > 0
 
-    for i, repo in enumerate(config["repos"]):
+    if not has_repos and not has_db_sources:
+        raise ConfigError("config.json needs at least one of 'repos' (non-empty list) or 'db_sources' (non-empty list).")
+
+    for i, repo in enumerate(config.get("repos", [])):
         if "name" not in repo:
             raise ConfigError(f"config.json repos[{i}] missing 'name'.")
         if "type" not in repo:
             raise ConfigError(f"config.json repos[{i}] ('{repo['name']}') missing 'type'.")
         if "path" not in repo and "url" not in repo:
             raise ConfigError(f"config.json repos[{i}] ('{repo['name']}') needs 'path' or 'url'.")
+
+    for i, db_src in enumerate(config.get("db_sources", [])):
+        if "name" not in db_src:
+            raise ConfigError(f"config.json db_sources[{i}] missing 'name'.")
+        if "path" not in db_src:
+            raise ConfigError(f"config.json db_sources[{i}] ('{db_src.get('name', '?')}') missing 'path'.")
+        if "query" not in db_src:
+            raise ConfigError(f"config.json db_sources[{i}] ('{db_src['name']}') missing 'query'.")
 
 
 # ---------------------------------------------------------------------------
@@ -90,7 +103,7 @@ def cmd_clone(config: dict):
     repos_dir = SCRIPT_DIR / config["sources"].get("repos_dir", "data/repos")
     repos_dir.mkdir(parents=True, exist_ok=True)
 
-    for repo in config["repos"]:
+    for repo in config.get("repos", []):
         url = repo.get("url")
         if not url:
             # Local path — no cloning needed
@@ -134,6 +147,75 @@ def cmd_clone(config: dict):
 # ---------------------------------------------------------------------------
 
 
+def _chunk_db_source(db_src: dict) -> list[dict]:
+    """Read chunks from a database source.
+
+    Each row from the configured query becomes one chunk.  Column mapping
+    is controlled by the db_source config entry.
+    """
+    name = db_src["name"]
+    db_type = db_src.get("type", "sqlite")
+    source_tag = db_src.get("source_tag", name)
+    query = db_src["query"]
+
+    text_col = db_src.get("text_column", "text")
+    id_col = db_src.get("id_column", "")
+    heading_col = db_src.get("heading_column", "")
+    category_col = db_src.get("category_column", "")
+    module_col = db_src.get("module_column", "")
+    type_name_col = db_src.get("type_name_column", "")
+
+    log.info(f"[db] Chunking '{name}' ({db_type})...")
+
+    if db_type != "sqlite":
+        log.warning(f"[db] Unsupported db type '{db_type}' for '{name}', skipping.")
+        return []
+
+    db_path = db_src["path"]
+    if not Path(db_path).exists():
+        log.warning(f"[db] Database not found: {db_path}, skipping '{name}'.")
+        return []
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(query).fetchall()
+    except sqlite3.OperationalError as e:
+        log.error(f"[db] Query failed for '{name}': {e}")
+        conn.close()
+        return []
+
+    columns = set(rows[0].keys()) if rows else set()
+    chunks = []
+
+    for row in rows:
+        text = str(row[text_col]) if text_col in columns else ""
+        if not text.strip():
+            continue
+
+        # Build chunk ID from source row ID or hash the text
+        if id_col and id_col in columns:
+            chunk_id = f"{source_tag}:{row[id_col]}"
+        else:
+            chunk_id = f"{source_tag}:{hashlib.sha256(text.encode()).hexdigest()[:16]}"
+
+        chunk = {
+            "id": chunk_id,
+            "text": text,
+            "source": source_tag,
+            "module_path": str(row[module_col]) if module_col and module_col in columns else "",
+            "type_name": str(row[type_name_col]) if type_name_col and type_name_col in columns else "",
+            "category": str(row[category_col]) if category_col and category_col in columns else "",
+            "heading": str(row[heading_col]) if heading_col and heading_col in columns else "",
+            "file_path": "",
+        }
+        chunks.append(chunk)
+
+    conn.close()
+    log.info(f"[db] '{name}': {len(chunks)} chunks from {len(rows)} rows")
+    return chunks
+
+
 def cmd_chunk(config: dict):
     """Run all chunkers and write chunks.jsonl."""
     chunks_path = SCRIPT_DIR / config["sources"]["chunks_path"]
@@ -142,18 +224,26 @@ def cmd_chunk(config: dict):
 
     all_chunks = []
 
-    for repo in config["repos"]:
+    for repo in config.get("repos", []):
         chunker_type = repo["type"]
         log.info(f"Chunking {repo['name']} ({chunker_type})...")
 
         # Resolve source directory
         if repo.get("path"):
             source_dir = Path(repo["path"])
+        elif repo.get("url"):
+            # URL-based repos: use local_dir or fall back to repo name (matches clone step)
+            local_dir = repo.get("local_dir", repo["name"])
+            source_dir = repos_dir / local_dir
         elif repo.get("local_dir"):
             source_dir = repos_dir / repo["local_dir"]
         else:
             log.warning(f"No path or local_dir for {repo['name']}, skipping.")
             continue
+
+        # Allow diving into a subdirectory (e.g. "Modules/FortniteGame")
+        if repo.get("source_subdir"):
+            source_dir = source_dir / repo["source_subdir"]
 
         try:
             chunker = get_chunker(chunker_type)
@@ -164,6 +254,11 @@ def cmd_chunk(config: dict):
         chunks = chunker.chunk_directory(source_dir, repo)
         all_chunks.extend(chunks)
 
+    # Chunk from database sources (if configured)
+    for db_src in config.get("db_sources", []):
+        db_chunks = _chunk_db_source(db_src)
+        all_chunks.extend(db_chunks)
+
     # Deduplicate by ID (keep first occurrence)
     seen = set()
     deduped = []
@@ -171,6 +266,9 @@ def cmd_chunk(config: dict):
         if chunk["id"] not in seen:
             seen.add(chunk["id"])
             deduped.append(chunk)
+
+    # Attach source file hashes for provenance tracking
+    _attach_source_hashes(deduped, config.get("repos", []), repos_dir)
 
     # Write chunks.jsonl
     with open(chunks_path, "w", encoding="utf-8") as f:
@@ -188,6 +286,100 @@ def _log_source_stats(chunks: list[dict]):
     counts = Counter(c["source"] for c in chunks)
     for source, count in sorted(counts.items()):
         log.info(f"  {source}: {count}")
+
+
+# ---------------------------------------------------------------------------
+# Source provenance
+# ---------------------------------------------------------------------------
+
+
+def _build_source_base_dirs(repos_config: list[dict], repos_dir: Path) -> dict[str, Path]:
+    """Build a mapping from source_tag → base directory for file path resolution.
+
+    Resolution rules:
+    1. If repo has 'path': base = Path(repo['path'])
+    2. If repo has 'url':  base = repos_dir / repo.get('local_dir', repo['name'])
+    3. If repo has 'source_subdir': base = base / source_subdir
+    """
+    base_dirs: dict[str, Path] = {}
+    for repo in repos_config:
+        source_tag = repo.get("source_tag", repo["name"])
+        if repo.get("path"):
+            base = Path(repo["path"])
+        elif repo.get("url"):
+            local_dir = repo.get("local_dir", repo["name"])
+            base = repos_dir / local_dir
+        else:
+            continue
+        if repo.get("source_subdir"):
+            base = base / repo["source_subdir"]
+        base_dirs[source_tag] = base
+    return base_dirs
+
+
+def _resolve_source_path(
+    file_path: str,
+    source_tag: str,
+    base_dirs: dict[str, Path],
+) -> Path | None:
+    """Resolve a chunk's file_path to an absolute path on disk.
+
+    Returns None if the source_tag has no known base directory.
+    """
+    base = base_dirs.get(source_tag)
+    if base is None:
+        return None
+    return base / file_path
+
+
+def _attach_source_hashes(chunks: list[dict], repos_config: list[dict], repos_dir: Path):
+    """Attach SHA-256 source hashes to chunks grouped by (source, file_path).
+
+    Modifies chunks in-place. Sets source_hash to '' for unresolvable or
+    missing files (logged as warnings).
+    """
+    base_dirs = _build_source_base_dirs(repos_config, repos_dir)
+
+    # Group chunks by (source, file_path) to hash each file once
+    from collections import defaultdict
+
+    groups: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    for chunk in chunks:
+        fp = chunk.get("file_path", "")
+        source = chunk.get("source", "")
+        if fp:
+            groups[(source, fp)].append(chunk)
+        else:
+            chunk["source_hash"] = ""
+
+    hashed = 0
+    skipped = 0
+    for (source, fp), group in groups.items():
+        resolved = _resolve_source_path(fp, source, base_dirs)
+        if resolved is None:
+            for c in group:
+                c["source_hash"] = ""
+            skipped += len(group)
+            continue
+
+        try:
+            content = resolved.read_bytes()
+            file_hash = hashlib.sha256(content).hexdigest()
+            for c in group:
+                c["source_hash"] = file_hash
+            hashed += len(group)
+        except FileNotFoundError:
+            log.warning(f"[hash] File missing (deleted after chunking?): {resolved}")
+            for c in group:
+                c["source_hash"] = ""
+            skipped += len(group)
+        except OSError as e:
+            log.warning(f"[hash] Could not read {resolved}: {e}")
+            for c in group:
+                c["source_hash"] = ""
+            skipped += len(group)
+
+    log.info(f"[hash] {hashed} chunks hashed, {skipped} skipped")
 
 
 # ---------------------------------------------------------------------------
@@ -300,6 +492,10 @@ async def _embed_async(config: dict):
     conn.execute("BEGIN")
     conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')")
     conn.commit()
+
+    # Write index metadata (provenance tracking)
+    _write_index_metadata(conn, config)
+
     conn.close()
 
     # Swap temp file into place (handles Windows file locking)
@@ -350,6 +546,8 @@ def _create_schema(conn: sqlite3.Connection):
             category TEXT DEFAULT '',
             heading TEXT DEFAULT '',
             file_path TEXT DEFAULT '',
+            source_hash TEXT DEFAULT '',
+            gotcha TEXT DEFAULT '',
             embedding BLOB
         );
 
@@ -362,6 +560,11 @@ def _create_schema(conn: sqlite3.Connection):
             category,
             content=chunks,
             content_rowid=rowid
+        );
+
+        CREATE TABLE IF NOT EXISTS index_metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
         );
 
         CREATE INDEX idx_chunks_source ON chunks(source);
@@ -382,8 +585,9 @@ def _insert_chunk(conn: sqlite3.Connection, chunk: dict, embedding: list[float])
 
     conn.execute(
         """INSERT OR IGNORE INTO chunks
-           (id, text, source, module_path, type_name, category, heading, file_path, embedding)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           (id, text, source, module_path, type_name, category, heading, file_path,
+            source_hash, gotcha, embedding)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             chunk["id"],
             chunk["text"],
@@ -393,6 +597,8 @@ def _insert_chunk(conn: sqlite3.Connection, chunk: dict, embedding: list[float])
             chunk.get("category", ""),
             chunk.get("heading", ""),
             chunk.get("file_path", ""),
+            chunk.get("source_hash", ""),
+            chunk.get("gotcha", ""),
             blob,
         ),
     )
@@ -403,6 +609,69 @@ def _insert_chunk(conn: sqlite3.Connection, chunk: dict, embedding: list[float])
            FROM chunks WHERE id = ?""",
         (chunk["id"],),
     )
+
+
+def _write_index_metadata(conn: sqlite3.Connection, config: dict):
+    """Write provenance metadata to the index_metadata table.
+
+    Stores the index timestamp and git commit hashes for each repo that
+    has a local .git directory.
+    """
+    from datetime import datetime, timezone
+
+    repos_dir = SCRIPT_DIR / config["sources"].get("repos_dir", "data/repos")
+    now = datetime.now(timezone.utc).isoformat()
+
+    conn.execute("BEGIN")
+    conn.execute(
+        "INSERT OR REPLACE INTO index_metadata (key, value) VALUES (?, ?)",
+        ("indexed_at", now),
+    )
+
+    # Store embedding model info for drift detection
+    embed_model = config.get("ollama", {}).get("embed_model", "unknown")
+    embed_dims = config.get("search", {}).get("embed_dimensions", 0)
+    conn.execute(
+        "INSERT OR REPLACE INTO index_metadata (key, value) VALUES (?, ?)",
+        ("embed_model", embed_model),
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO index_metadata (key, value) VALUES (?, ?)",
+        ("embed_dimensions", str(embed_dims)),
+    )
+
+    for repo in config.get("repos", []):
+        name = repo["name"]
+        # Resolve the repo directory
+        if repo.get("path"):
+            repo_dir = Path(repo["path"])
+        elif repo.get("url"):
+            local_dir = repo.get("local_dir", name)
+            repo_dir = repos_dir / local_dir
+        else:
+            continue
+
+        # Check for git repo and capture commit hash
+        git_dir = repo_dir / ".git"
+        if git_dir.exists():
+            try:
+                result = subprocess.run(
+                    ["git", "-C", str(repo_dir), "rev-parse", "HEAD"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                if result.returncode == 0:
+                    commit = result.stdout.strip()
+                    conn.execute(
+                        "INSERT OR REPLACE INTO index_metadata (key, value) VALUES (?, ?)",
+                        (f"repo:{name}:commit", commit),
+                    )
+            except (subprocess.TimeoutExpired, OSError) as e:
+                log.warning(f"[metadata] Could not get git commit for {name}: {e}")
+
+    conn.commit()
+    log.info(f"[metadata] Index metadata written (indexed_at: {now})")
 
 
 # ---------------------------------------------------------------------------
@@ -460,6 +729,706 @@ def cmd_stats(config: dict):
 
 
 # ---------------------------------------------------------------------------
+# Verify
+# ---------------------------------------------------------------------------
+
+
+def cmd_verify(config: dict):
+    """Verify index health and search quality.
+
+    Runs automatic checks (schema, sources, embeddings, FTS5) and
+    optional user-defined test queries from config.json "verify" section.
+    Returns exit code 0 if all checks pass, 1 if any fail.
+    """
+    asyncio.run(_verify_async(config))
+
+
+async def _verify_async(config: dict):
+    db_path = SCRIPT_DIR / config["database"]["path"]
+    if not db_path.exists():
+        log.error(f"[verify] Database not found: {db_path}")
+        log.error("[verify] Run 'rebuild' first.")
+        sys.exit(1)
+
+    dimensions = config["search"]["embed_dimensions"]
+    expected_blob_size = dimensions * 4  # float32
+
+    conn = sqlite3.connect(str(db_path))
+    passed = 0
+    failed = 0
+    warnings = 0
+
+    def check(name: str, ok: bool, detail: str = ""):
+        nonlocal passed, failed
+        if ok:
+            passed += 1
+            log.info(f"  PASS  {name}" + (f" — {detail}" if detail else ""))
+        else:
+            failed += 1
+            log.error(f"  FAIL  {name}" + (f" — {detail}" if detail else ""))
+
+    def warn(name: str, detail: str):
+        nonlocal warnings
+        warnings += 1
+        log.warning(f"  WARN  {name} — {detail}")
+
+    log.info("[verify] Running index health checks...")
+    log.info("")
+
+    # --- Schema checks ---
+    log.info("Schema:")
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    check("chunks table exists", "chunks" in tables)
+    check("chunks_fts table exists", "chunks_fts" in tables)
+
+    # Column check
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(chunks)").fetchall()}
+    expected_cols = {"id", "text", "source", "module_path", "type_name", "category", "heading", "file_path", "embedding"}
+    missing_cols = expected_cols - cols
+    check("chunks columns complete", not missing_cols, f"missing: {missing_cols}" if missing_cols else "")
+
+    # --- Content checks ---
+    log.info("")
+    log.info("Content:")
+    total = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+    check("chunks not empty", total > 0, f"{total} chunks")
+
+    # Source distribution
+    sources = conn.execute("SELECT source, COUNT(*) FROM chunks GROUP BY source ORDER BY source").fetchall()
+    for source, count in sources:
+        log.info(f"         {source}: {count}")
+
+    # Check all configured source_tags are represented
+    expected_sources = {r.get("source_tag", r["name"]) for r in config.get("repos", [])}
+    expected_sources |= {r.get("source_tag", r["name"]) for r in config.get("db_sources", [])}
+    actual_sources = {r[0] for r in sources}
+    missing_sources = expected_sources - actual_sources
+    if missing_sources:
+        warn("source coverage", f"configured sources not in DB: {missing_sources}")
+    else:
+        check("all configured sources indexed", True, f"{len(actual_sources)} sources")
+
+    # --- Embedding checks ---
+    log.info("")
+    log.info("Embeddings:")
+    null_embeddings = conn.execute("SELECT COUNT(*) FROM chunks WHERE embedding IS NULL").fetchone()[0]
+    check("no null embeddings", null_embeddings == 0, f"{null_embeddings} null" if null_embeddings else "")
+
+    # Spot-check dimensions on a sample
+    sample = conn.execute("SELECT id, LENGTH(embedding) FROM chunks WHERE embedding IS NOT NULL LIMIT 20").fetchall()
+    bad_dims = [(cid, blen) for cid, blen in sample if blen != expected_blob_size]
+    check(
+        f"embedding dimensions ({dimensions}d = {expected_blob_size} bytes)",
+        not bad_dims,
+        f"{len(bad_dims)} mismatched: {bad_dims[:3]}" if bad_dims else f"checked {len(sample)} samples",
+    )
+
+    # --- FTS5 integrity ---
+    log.info("")
+    log.info("FTS5:")
+    try:
+        fts_count = conn.execute(
+            "SELECT COUNT(*) FROM chunks_fts"
+        ).fetchone()[0]
+        check("FTS5 populated", fts_count > 0, f"{fts_count} entries")
+        check("FTS5 matches chunks", fts_count == total, f"FTS5={fts_count} vs chunks={total}")
+    except sqlite3.OperationalError as e:
+        check("FTS5 readable", False, str(e))
+
+    # --- Search quality (requires Ollama) ---
+    verify_config = config.get("verify", {})
+    test_queries = verify_config.get("queries", [])
+
+    if test_queries:
+        log.info("")
+        log.info("Search quality:")
+
+        ollama_host = config["ollama"]["host"]
+        embed_model = config["ollama"]["embed_model"]
+        embed_timeout = config["ollama"].get("embed_timeout", 30.0)
+
+        # Load embeddings for similarity search
+        import numpy as np
+
+        rows = conn.execute("SELECT id, embedding FROM chunks WHERE embedding IS NOT NULL").fetchall()
+        chunk_ids = [r[0] for r in rows]
+        embeddings = np.array(
+            [struct.unpack(f"{dimensions}f", r[1]) for r in rows],
+            dtype=np.float32,
+        )
+
+        # Pre-load metadata for filtering
+        meta_rows = conn.execute("SELECT id, source, module_path, type_name FROM chunks").fetchall()
+        meta_by_id = {r[0]: {"source": r[1], "module_path": r[2], "type_name": r[3]} for r in meta_rows}
+
+        ollama_available = True
+
+        async with httpx.AsyncClient(timeout=embed_timeout) as client:
+            for tq in test_queries:
+                min_results = tq.get("min_results", 1)
+
+                if "query" in tq:
+                    # Semantic search test (requires Ollama)
+                    if not ollama_available:
+                        continue
+                    query_text = tq["query"]
+                    try:
+                        resp = await client.post(
+                            f"{ollama_host}/api/embeddings",
+                            json={"model": embed_model, "prompt": f"search_query: {query_text}"},
+                        )
+                        resp.raise_for_status()
+                        query_vec = np.array(resp.json()["embedding"], dtype=np.float32)
+                        # Normalize
+                        norm = np.linalg.norm(query_vec)
+                        if norm > 0:
+                            query_vec /= norm
+
+                        similarities = embeddings @ query_vec
+                        top_k = min(tq.get("top_k", 5), len(chunk_ids))
+                        top_indices = np.argsort(similarities)[-top_k:][::-1]
+
+                        results = []
+                        for idx in top_indices:
+                            cid = chunk_ids[idx]
+                            score = float(similarities[idx])
+                            meta = meta_by_id.get(cid, {})
+                            results.append({"id": cid, "score": score, **meta})
+
+                        # Apply filters
+                        if tq.get("expect_source"):
+                            results = [r for r in results if r.get("source") == tq["expect_source"]]
+
+                        check(
+                            f"search \"{query_text}\"",
+                            len(results) >= min_results,
+                            f"{len(results)} results (need {min_results}), "
+                            f"top: {results[0]['id']} ({results[0]['score']:.3f})" if results else "no results",
+                        )
+                    except httpx.ConnectError:
+                        warn(f"search \"{query_text}\"", "Ollama not reachable — skipping semantic tests")
+                        ollama_available = False
+                    except Exception as e:
+                        check(f"search \"{query_text}\"", False, str(e))
+
+                elif "lookup" in tq:
+                    # Keyword lookup test (pure SQLite, no Ollama needed)
+                    name = tq["lookup"]
+                    lookup_rows = conn.execute(
+                        "SELECT id, source, type_name FROM chunks WHERE type_name = ? LIMIT 5",
+                        (name,),
+                    ).fetchall()
+                    if not lookup_rows:
+                        # Fallback to LIKE
+                        safe = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                        lookup_rows = conn.execute(
+                            "SELECT id, source, type_name FROM chunks WHERE type_name LIKE ? ESCAPE '\\' LIMIT 5",
+                            (f"%{safe}%",),
+                        ).fetchall()
+
+                    check(
+                        f"lookup \"{name}\"",
+                        len(lookup_rows) >= min_results,
+                        f"{len(lookup_rows)} results" + (f", first: {lookup_rows[0][0]}" if lookup_rows else ""),
+                    )
+
+    conn.close()
+
+    # --- Summary ---
+    log.info("")
+    total_checks = passed + failed
+    if failed == 0:
+        log.info(f"[verify] ALL PASSED ({passed} checks, {warnings} warnings)")
+    else:
+        log.error(f"[verify] {failed} FAILED / {passed} passed / {warnings} warnings")
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Stale
+# ---------------------------------------------------------------------------
+
+
+def cmd_stale(config: dict):
+    """Check for stale chunks by comparing source hashes and git commits.
+
+    Two-level check:
+    1. Repo-level (fast): compare stored git commit vs current HEAD.
+    2. File-level (thorough): compare stored source_hash vs current file SHA-256.
+
+    Exit code: 0 if all fresh, 1 if any stale or missing.
+    """
+    db_path = SCRIPT_DIR / config["database"]["path"]
+    if not db_path.exists():
+        log.error(f"[stale] Database not found: {db_path}")
+        sys.exit(1)
+
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    repos_dir = SCRIPT_DIR / config["sources"].get("repos_dir", "data/repos")
+    base_dirs = _build_source_base_dirs(config.get("repos", []), repos_dir)
+
+    stale_repos = []
+    fresh_repos = []
+    skipped_repos = []
+    upstream_behind = []
+    stale_files = 0
+    missing_files = 0
+    fresh_files = 0
+
+    # --- Repo-level check (git commit comparison) ---
+    log.info("[stale] Checking repo versions...")
+    metadata_rows = conn.execute("SELECT key, value FROM index_metadata").fetchall()
+    metadata = {r["key"]: r["value"] for r in metadata_rows}
+
+    indexed_at = metadata.get("indexed_at", "unknown")
+    log.info(f"[stale] Index built at: {indexed_at}")
+
+    # Check for embedding model drift
+    stored_model = metadata.get("embed_model")
+    config_model = config.get("ollama", {}).get("embed_model", "unknown")
+    if stored_model and stored_model != config_model:
+        log.warning(
+            f"[stale] Embedding model changed: index used '{stored_model}', "
+            f"config has '{config_model}' — full rebuild required"
+        )
+
+    for repo in config.get("repos", []):
+        name = repo["name"]
+        stored_commit = metadata.get(f"repo:{name}:commit")
+        if not stored_commit:
+            skipped_repos.append(name)
+            continue
+
+        # Resolve repo directory
+        if repo.get("path"):
+            repo_dir = Path(repo["path"])
+        elif repo.get("url"):
+            local_dir = repo.get("local_dir", name)
+            repo_dir = repos_dir / local_dir
+        else:
+            skipped_repos.append(name)
+            continue
+
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(repo_dir), "rev-parse", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode == 0:
+                current_commit = result.stdout.strip()
+                if current_commit != stored_commit:
+                    log.info(
+                        f"[stale] Repo '{name}': commit changed "
+                        f"({stored_commit[:7]} -> {current_commit[:7]})"
+                    )
+                    stale_repos.append(name)
+                else:
+                    fresh_repos.append(name)
+
+                    # Check upstream for unpulled commits (git repos only)
+                    if repo.get("url"):
+                        try:
+                            # Fetch remote refs without downloading objects
+                            subprocess.run(
+                                ["git", "-C", str(repo_dir), "fetch", "--dry-run"],
+                                capture_output=True, text=True, timeout=30,
+                            )
+                            # Compare local HEAD to remote tracking branch
+                            remote_result = subprocess.run(
+                                ["git", "-C", str(repo_dir), "rev-parse", "@{u}"],
+                                capture_output=True, text=True, timeout=10,
+                            )
+                            if remote_result.returncode == 0:
+                                remote_head = remote_result.stdout.strip()
+                                if remote_head != current_commit:
+                                    upstream_behind.append(name)
+                                    log.info(f"[stale] Repo '{name}': upstream has new commits")
+                        except (subprocess.TimeoutExpired, OSError):
+                            pass  # Network check is best-effort
+            else:
+                skipped_repos.append(name)
+        except (subprocess.TimeoutExpired, OSError):
+            skipped_repos.append(name)
+
+    # --- File-level check (source hash comparison) ---
+    log.info("[stale] Checking file hashes...")
+    rows = conn.execute(
+        "SELECT DISTINCT file_path, source, source_hash FROM chunks WHERE source_hash != ''"
+    ).fetchall()
+
+    for row in rows:
+        fp = row["file_path"]
+        source = row["source"]
+        stored_hash = row["source_hash"]
+
+        resolved = _resolve_source_path(fp, source, base_dirs)
+        if resolved is None:
+            missing_files += 1
+            continue
+
+        try:
+            current_hash = hashlib.sha256(resolved.read_bytes()).hexdigest()
+            if current_hash != stored_hash:
+                log.info(f"[stale]   {fp}: content changed")
+                stale_files += 1
+            else:
+                fresh_files += 1
+        except FileNotFoundError:
+            log.info(f"[stale]   {fp}: file missing")
+            missing_files += 1
+        except OSError:
+            missing_files += 1
+
+    conn.close()
+
+    # --- Summary ---
+    log.info("")
+    if fresh_repos:
+        log.info(f"[stale] Fresh repos: {', '.join(fresh_repos)}")
+    if stale_repos:
+        log.info(f"[stale] Stale repos: {', '.join(stale_repos)}")
+    if upstream_behind:
+        log.info(f"[stale] Upstream updates available: {', '.join(upstream_behind)}")
+    if skipped_repos:
+        log.info(f"[stale] Skipped repos (no git): {', '.join(skipped_repos)}")
+    log.info(f"[stale] Files: {fresh_files} fresh, {stale_files} stale, {missing_files} missing")
+
+    if stale_repos or stale_files or missing_files:
+        log.info("[stale] Index is STALE — run 'rebuild' to update")
+        sys.exit(1)
+    elif upstream_behind:
+        log.info("[stale] Index is fresh locally, but upstream repos have updates — run 'clone' then 'rebuild'")
+        sys.exit(1)
+    else:
+        log.info("[stale] Index is FRESH")
+
+
+# ---------------------------------------------------------------------------
+# Freshness
+# ---------------------------------------------------------------------------
+
+
+def cmd_freshness(config: dict):
+    """Print a unified freshness report: index age, model version, source lag.
+
+    Unlike cmd_stale (which exits non-zero for CI), this is a human-readable
+    dashboard showing everything relevant to content quality.
+    """
+    from datetime import datetime, timezone
+
+    db_path = SCRIPT_DIR / config["database"]["path"]
+    if not db_path.exists():
+        log.error(f"[freshness] Database not found: {db_path}")
+        sys.exit(1)
+
+    conn = sqlite3.connect(str(db_path))
+    metadata_rows = conn.execute("SELECT key, value FROM index_metadata").fetchall()
+    metadata = {r[0]: r[1] for r in metadata_rows}
+
+    chunk_count = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+    source_counts = conn.execute(
+        "SELECT source, COUNT(*) FROM chunks GROUP BY source ORDER BY COUNT(*) DESC"
+    ).fetchall()
+    conn.close()
+
+    repos_dir = SCRIPT_DIR / config["sources"].get("repos_dir", "data/repos")
+    issues = []
+
+    # --- Index age ---
+    indexed_at = metadata.get("indexed_at", "unknown")
+    print(f"\n{'=' * 60}")
+    print("  Freshness Report")
+    print("=" * 60)
+    print(f"\n  Index built:  {indexed_at}")
+
+    if indexed_at != "unknown":
+        try:
+            built = datetime.fromisoformat(indexed_at)
+            age = datetime.now(timezone.utc) - built
+            age_str = f"{age.days}d {age.seconds // 3600}h ago"
+            print(f"  Index age:    {age_str}")
+            if age.days > 7:
+                issues.append(f"Index is {age.days} days old — consider rebuilding")
+        except ValueError:
+            pass
+
+    print(f"  Total chunks: {chunk_count}")
+
+    # --- Embedding model ---
+    stored_model = metadata.get("embed_model", "not tracked")
+    stored_dims = metadata.get("embed_dimensions", "not tracked")
+    config_model = config.get("ollama", {}).get("embed_model", "unknown")
+    config_dims = config.get("search", {}).get("embed_dimensions", 0)
+
+    print(f"\n  Embed model (index):  {stored_model} ({stored_dims}d)")
+    print(f"  Embed model (config): {config_model} ({config_dims}d)")
+
+    if stored_model != "not tracked" and stored_model != config_model:
+        issues.append(
+            f"Model mismatch: index used '{stored_model}', config has '{config_model}' — full rebuild required"
+        )
+    if stored_dims != "not tracked" and str(config_dims) != stored_dims:
+        issues.append(
+            f"Dimension mismatch: index has {stored_dims}d, config has {config_dims}d — full rebuild required"
+        )
+
+    # --- Source repos ---
+    print(f"\n  {'Source':<25} {'Chunks':>7}  {'Status'}")
+    print(f"  {'-' * 25} {'-' * 7}  {'-' * 30}")
+
+    for repo in config.get("repos", []):
+        name = repo["name"]
+        source_tag = repo.get("source_tag", name)
+        count = next((c for s, c in source_counts if s == source_tag), 0)
+
+        stored_commit = metadata.get(f"repo:{name}:commit", "")
+        status_parts = []
+
+        # Resolve repo directory
+        if repo.get("path"):
+            repo_dir = Path(repo["path"])
+        elif repo.get("url"):
+            local_dir = repo.get("local_dir", name)
+            repo_dir = repos_dir / local_dir
+        else:
+            repo_dir = None
+
+        if repo_dir and repo_dir.exists():
+            try:
+                result = subprocess.run(
+                    ["git", "-C", str(repo_dir), "rev-parse", "HEAD"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if result.returncode == 0:
+                    current = result.stdout.strip()
+                    if stored_commit and current != stored_commit:
+                        status_parts.append("LOCAL CHANGED")
+                    elif stored_commit:
+                        status_parts.append("fresh")
+                    else:
+                        status_parts.append("no commit tracked")
+            except (subprocess.TimeoutExpired, OSError):
+                status_parts.append("git error")
+        elif repo_dir:
+            status_parts.append("NOT CLONED")
+            issues.append(f"Repo '{name}' not cloned: {repo_dir}")
+        else:
+            status_parts.append("no path")
+
+        if count == 0:
+            status_parts.append("0 chunks!")
+            issues.append(f"Source '{source_tag}' has 0 chunks in the index")
+
+        status = ", ".join(status_parts)
+        print(f"  {name:<25} {count:>7}  {status}")
+
+    # --- DB sources ---
+    for db_src in config.get("db_sources", []):
+        name = db_src["name"]
+        source_tag = db_src.get("source_tag", name)
+        count = next((c for s, c in source_counts if s == source_tag), 0)
+        db_file = Path(db_src["path"])
+        status = "exists" if db_file.exists() else "MISSING"
+        if count == 0:
+            status += ", 0 chunks!"
+        print(f"  {name:<25} {count:>7}  {status} (db_source)")
+
+    # --- Issues ---
+    if issues:
+        print(f"\n  Issues ({len(issues)}):")
+        for issue in issues:
+            print(f"    - {issue}")
+    else:
+        print(f"\n  No issues found.")
+
+    print(f"\n{'=' * 60}\n")
+
+
+# ---------------------------------------------------------------------------
+# Ingest
+# ---------------------------------------------------------------------------
+
+
+def cmd_ingest(config: dict):
+    """Incrementally ingest new chunks from an ingest queue file.
+
+    Reads pre-formatted chunk dicts from the ingest path, embeds them,
+    and appends to the existing database. Does NOT rebuild from scratch.
+
+    The ingest file is atomically replaced with an empty file after
+    processing, so concurrent writers (e.g. Orchestration) won't lose
+    entries that arrive during processing.
+    """
+    asyncio.run(_ingest_async(config))
+
+
+async def _ingest_async(config: dict):
+    ingest_path = SCRIPT_DIR / config["sources"].get("ingest_path", "data/ingest.jsonl")
+    db_path = SCRIPT_DIR / config["database"]["path"]
+
+    if not ingest_path.exists() or ingest_path.stat().st_size == 0:
+        log.info("[ingest] No entries to ingest.")
+        return
+
+    if not db_path.exists():
+        log.error(f"[ingest] Database not found: {db_path}. Run 'rebuild' first.")
+        return
+
+    # Read all entries into memory, then replace file with empty one
+    raw_lines = ingest_path.read_text(encoding="utf-8").splitlines()
+    tmp_empty = ingest_path.with_suffix(".jsonl.tmp")
+    tmp_empty.write_text("", encoding="utf-8")
+    try:
+        os.replace(str(tmp_empty), str(ingest_path))
+    except OSError:
+        # Windows fallback
+        try:
+            ingest_path.write_text("", encoding="utf-8")
+            tmp_empty.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    # Parse and validate entries
+    chunks = []
+    for i, line in enumerate(raw_lines):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            log.warning(f"[ingest] Skipping malformed JSON on line {i + 1}")
+            continue
+        if not all(k in entry for k in ("id", "text", "source")):
+            log.warning(f"[ingest] Skipping entry missing required fields on line {i + 1}")
+            continue
+        chunks.append(entry)
+
+    if not chunks:
+        log.info("[ingest] No valid entries to ingest.")
+        return
+
+    # Deduplicate against existing DB
+    conn = sqlite3.connect(str(db_path), isolation_level=None)
+    existing_ids = {
+        r[0]
+        for r in conn.execute("SELECT id FROM chunks").fetchall()
+    }
+    new_chunks = [c for c in chunks if c["id"] not in existing_ids]
+    if not new_chunks:
+        log.info(f"[ingest] All {len(chunks)} entries already exist in DB.")
+        conn.close()
+        return
+
+    log.info(f"[ingest] {len(new_chunks)} new entries to embed (skipped {len(chunks) - len(new_chunks)} duplicates)")
+
+    # Embed and insert
+    ollama_host = config["ollama"]["host"]
+    embed_model = config["ollama"]["embed_model"]
+    embed_timeout = config["ollama"].get("embed_timeout", 30.0)
+    dimensions = config["search"]["embed_dimensions"]
+    pipeline_config = config.get("pipeline", {})
+    concurrency = pipeline_config.get("concurrency", 4)
+    max_retries = max(1, pipeline_config.get("max_retries", 3))
+    max_embed_chars = pipeline_config.get("max_embed_chars", 6000)
+
+    semaphore = asyncio.Semaphore(concurrency)
+    embed_url = f"{ollama_host}/api/embeddings"
+    embedded = 0
+    errors = 0
+
+    async with httpx.AsyncClient(timeout=embed_timeout) as client:
+
+        async def embed_one(chunk: dict) -> tuple[dict, list[float] | None]:
+            nonlocal embedded, errors
+            async with semaphore:
+                text = "search_document: " + chunk["text"][:max_embed_chars]
+                body = {"model": embed_model, "prompt": text}
+                for attempt in range(max_retries):
+                    try:
+                        resp = await client.post(embed_url, json=body)
+                        resp.raise_for_status()
+                        embedding = resp.json().get("embedding", [])
+                        embedded += 1
+                        return chunk, embedding
+                    except Exception as e:
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(1.0)
+                            continue
+                        errors += 1
+                        if errors <= 5:
+                            log.error(f"[ingest] Error embedding {chunk['id']}: {e}")
+                        return chunk, None
+
+        tasks = [embed_one(c) for c in new_chunks]
+        results = await asyncio.gather(*tasks)
+
+        conn.execute("BEGIN")
+        for chunk, embedding in results:
+            if embedding is None:
+                continue
+            if len(embedding) != dimensions:
+                continue
+            _insert_chunk(conn, chunk, embedding)
+        conn.commit()
+
+    # Write ingest metadata
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute("BEGIN")
+    conn.execute(
+        "INSERT OR REPLACE INTO index_metadata (key, value) VALUES (?, ?)",
+        ("last_ingest_at", now),
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO index_metadata (key, value) VALUES (?, ?)",
+        ("last_ingest_count", str(embedded)),
+    )
+    conn.commit()
+
+    conn.close()
+    log.info(f"[ingest] Done — {embedded} embedded, {errors} errors")
+
+
+# ---------------------------------------------------------------------------
+# Gotcha
+# ---------------------------------------------------------------------------
+
+
+def cmd_gotcha(config: dict, chunk_id: str, gotcha_text: str):
+    """Add or update a gotcha note on an existing chunk.
+
+    Usage: python pipeline.py gotcha <chunk_id> "gotcha text"
+
+    Gotcha notes are anti-hallucination annotations displayed alongside
+    search results to warn about common misdiagnoses.
+    """
+    db_path = SCRIPT_DIR / config["database"]["path"]
+
+    if not db_path.exists():
+        log.error(f"[gotcha] Database not found: {db_path}")
+        sys.exit(1)
+
+    conn = sqlite3.connect(str(db_path))
+    row = conn.execute("SELECT id FROM chunks WHERE id = ?", (chunk_id,)).fetchone()
+    if not row:
+        log.error(f"[gotcha] Chunk not found: {chunk_id}")
+        conn.close()
+        sys.exit(1)
+
+    conn.execute("UPDATE chunks SET gotcha = ? WHERE id = ?", (gotcha_text, chunk_id))
+    conn.commit()
+    conn.close()
+
+    log.info(f"[gotcha] Updated chunk {chunk_id}")
+    log.info(f"[gotcha] Text: {gotcha_text}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -470,9 +1439,10 @@ def main():
         format="%(levelname)s: %(message)s",
     )
 
+    commands = "clone, chunk, embed, rebuild, stats, verify, stale, freshness, ingest, gotcha"
     if len(sys.argv) < 2:
         print("Usage: python pipeline.py <command>")
-        print("Commands: clone, chunk, embed, rebuild, stats")
+        print(f"Commands: {commands}")
         sys.exit(1)
 
     command = sys.argv[1]
@@ -490,9 +1460,22 @@ def main():
         cmd_embed(config)
     elif command == "stats":
         cmd_stats(config)
+    elif command == "verify":
+        cmd_verify(config)
+    elif command == "stale":
+        cmd_stale(config)
+    elif command == "freshness":
+        cmd_freshness(config)
+    elif command == "ingest":
+        cmd_ingest(config)
+    elif command == "gotcha":
+        if len(sys.argv) < 4:
+            print('Usage: python pipeline.py gotcha <chunk_id> "gotcha text"')
+            sys.exit(1)
+        cmd_gotcha(config, sys.argv[2], sys.argv[3])
     else:
         log.error(f"Unknown command: {command}")
-        print("Commands: clone, chunk, embed, rebuild, stats")
+        print(f"Commands: {commands}")
         sys.exit(1)
 
 
