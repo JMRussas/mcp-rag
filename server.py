@@ -70,12 +70,28 @@ def _rrf_fuse(ranked_lists: list[list[str]], k: int = 60) -> list[tuple[str, flo
 
 
 def _confidence_tier(score: float, high_thresh: float, med_thresh: float) -> str:
-    """Classify a similarity score into a confidence tier."""
+    """Classify a similarity score into a confidence tier.
+
+    Thresholds should be calibrated to the score range:
+    - Cosine similarity: 0.0–1.0 (default thresholds 0.85/0.65)
+    - RRF scores: ~0.001–0.016 (use rrf_confidence_thresholds())
+    """
     if score >= high_thresh:
         return "HIGH"
     if score >= med_thresh:
         return "MEDIUM"
     return "LOW"
+
+
+def _rrf_confidence_thresholds(k: int = 60) -> tuple[float, float]:
+    """Return (high, medium) thresholds calibrated for RRF scores.
+
+    RRF score = 1/(k + rank + 1).  Top-1 ≈ 1/(k+1), Top-3 ≈ 1/(k+4).
+    High = top-3 results, Medium = top-10.
+    """
+    high = 1.0 / (k + 4)   # rank 3
+    med = 1.0 / (k + 11)   # rank 10
+    return high, med
 
 
 def _get_gotcha(row) -> str:
@@ -383,9 +399,15 @@ def create_server(config_path: Path | None = None) -> FastMCP:
         results = results[:top_k]
         final_scores = {r["id"]: result_scores.get(r["id"], 0.0) for r in results}
 
-        # Classify confidence tiers
+        # Classify confidence tiers (thresholds depend on score range)
+        if reranker_enabled or hybrid_enabled:
+            # RRF/reranker scores are not cosine similarities — use rank-calibrated thresholds
+            tier_high, tier_med = _rrf_confidence_thresholds(rrf_k)
+        else:
+            tier_high, tier_med = confidence_high, confidence_medium
+
         tiers = {
-            r["id"]: _confidence_tier(final_scores.get(r["id"], 0.0), confidence_high, confidence_medium)
+            r["id"]: _confidence_tier(final_scores.get(r["id"], 0.0), tier_high, tier_med)
             for r in results
         }
 

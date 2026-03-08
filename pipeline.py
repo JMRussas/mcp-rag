@@ -993,7 +993,6 @@ def cmd_stale(config: dict):
             f"config has '{config_model}' — full rebuild required"
         )
 
-    stale_source_tags = set()
     for repo in config.get("repos", []):
         name = repo["name"]
         stored_commit = metadata.get(f"repo:{name}:commit")
@@ -1026,8 +1025,6 @@ def cmd_stale(config: dict):
                         f"({stored_commit[:7]} -> {current_commit[:7]})"
                     )
                     stale_repos.append(name)
-                    source_tag = repo.get("source_tag", name)
-                    stale_source_tags.add(source_tag)
                 else:
                     fresh_repos.append(name)
 
@@ -1138,8 +1135,8 @@ def cmd_freshness(config: dict):
     # --- Index age ---
     indexed_at = metadata.get("indexed_at", "unknown")
     print(f"\n{'=' * 60}")
-    print(f"  Freshness Report")
-    print(f"{'=' * 60}")
+    print("  Freshness Report")
+    print("=" * 60)
     print(f"\n  Index built:  {indexed_at}")
 
     if indexed_at != "unknown":
@@ -1158,8 +1155,8 @@ def cmd_freshness(config: dict):
     # --- Embedding model ---
     stored_model = metadata.get("embed_model", "not tracked")
     stored_dims = metadata.get("embed_dimensions", "not tracked")
-    config_model = config["ollama"].get("embed_model", "unknown")
-    config_dims = config["search"].get("embed_dimensions", 0)
+    config_model = config.get("ollama", {}).get("embed_model", "unknown")
+    config_dims = config.get("search", {}).get("embed_dimensions", 0)
 
     print(f"\n  Embed model (index):  {stored_model} ({stored_dims}d)")
     print(f"  Embed model (config): {config_model} ({config_dims}d)")
