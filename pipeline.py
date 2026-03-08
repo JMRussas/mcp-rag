@@ -231,6 +231,10 @@ def cmd_chunk(config: dict):
         # Resolve source directory
         if repo.get("path"):
             source_dir = Path(repo["path"])
+        elif repo.get("url"):
+            # URL-based repos: use local_dir or fall back to repo name (matches clone step)
+            local_dir = repo.get("local_dir", repo["name"])
+            source_dir = repos_dir / local_dir
         elif repo.get("local_dir"):
             source_dir = repos_dir / repo["local_dir"]
         else:
@@ -624,6 +628,18 @@ def _write_index_metadata(conn: sqlite3.Connection, config: dict):
         ("indexed_at", now),
     )
 
+    # Store embedding model info for drift detection
+    embed_model = config.get("ollama", {}).get("embed_model", "unknown")
+    embed_dims = config.get("search", {}).get("embed_dimensions", 0)
+    conn.execute(
+        "INSERT OR REPLACE INTO index_metadata (key, value) VALUES (?, ?)",
+        ("embed_model", embed_model),
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO index_metadata (key, value) VALUES (?, ?)",
+        ("embed_dimensions", str(embed_dims)),
+    )
+
     for repo in config.get("repos", []):
         name = repo["name"]
         # Resolve the repo directory
@@ -955,6 +971,7 @@ def cmd_stale(config: dict):
     stale_repos = []
     fresh_repos = []
     skipped_repos = []
+    upstream_behind = []
     stale_files = 0
     missing_files = 0
     fresh_files = 0
@@ -966,6 +983,15 @@ def cmd_stale(config: dict):
 
     indexed_at = metadata.get("indexed_at", "unknown")
     log.info(f"[stale] Index built at: {indexed_at}")
+
+    # Check for embedding model drift
+    stored_model = metadata.get("embed_model")
+    config_model = config.get("ollama", {}).get("embed_model", "unknown")
+    if stored_model and stored_model != config_model:
+        log.warning(
+            f"[stale] Embedding model changed: index used '{stored_model}', "
+            f"config has '{config_model}' — full rebuild required"
+        )
 
     stale_source_tags = set()
     for repo in config.get("repos", []):
@@ -1004,6 +1030,22 @@ def cmd_stale(config: dict):
                     stale_source_tags.add(source_tag)
                 else:
                     fresh_repos.append(name)
+
+                    # Check upstream for unpulled commits (git repos only)
+                    if repo.get("url"):
+                        try:
+                            fetch_result = subprocess.run(
+                                ["git", "-C", str(repo_dir), "fetch", "--dry-run"],
+                                capture_output=True,
+                                text=True,
+                                timeout=30,
+                            )
+                            # Non-empty stderr means there are upstream changes
+                            if fetch_result.stderr.strip():
+                                upstream_behind.append(name)
+                                log.info(f"[stale] Repo '{name}': upstream has new commits")
+                        except (subprocess.TimeoutExpired, OSError):
+                            pass  # Network check is best-effort
             else:
                 skipped_repos.append(name)
         except (subprocess.TimeoutExpired, OSError):
@@ -1046,6 +1088,8 @@ def cmd_stale(config: dict):
         log.info(f"[stale] Fresh repos: {', '.join(fresh_repos)}")
     if stale_repos:
         log.info(f"[stale] Stale repos: {', '.join(stale_repos)}")
+    if upstream_behind:
+        log.info(f"[stale] Upstream updates available: {', '.join(upstream_behind)}")
     if skipped_repos:
         log.info(f"[stale] Skipped repos (no git): {', '.join(skipped_repos)}")
     log.info(f"[stale] Files: {fresh_files} fresh, {stale_files} stale, {missing_files} missing")
@@ -1053,8 +1097,152 @@ def cmd_stale(config: dict):
     if stale_repos or stale_files or missing_files:
         log.info("[stale] Index is STALE — run 'rebuild' to update")
         sys.exit(1)
+    elif upstream_behind:
+        log.info("[stale] Index is fresh locally, but upstream repos have updates — run 'clone' then 'rebuild'")
+        sys.exit(1)
     else:
         log.info("[stale] Index is FRESH")
+
+
+# ---------------------------------------------------------------------------
+# Freshness
+# ---------------------------------------------------------------------------
+
+
+def cmd_freshness(config: dict):
+    """Print a unified freshness report: index age, model version, source lag.
+
+    Unlike cmd_stale (which exits non-zero for CI), this is a human-readable
+    dashboard showing everything relevant to content quality.
+    """
+    from datetime import datetime, timezone
+
+    db_path = SCRIPT_DIR / config["database"]["path"]
+    if not db_path.exists():
+        log.error(f"[freshness] Database not found: {db_path}")
+        sys.exit(1)
+
+    conn = sqlite3.connect(str(db_path))
+    metadata_rows = conn.execute("SELECT key, value FROM index_metadata").fetchall()
+    metadata = {r[0]: r[1] for r in metadata_rows}
+
+    chunk_count = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+    source_counts = conn.execute(
+        "SELECT source, COUNT(*) FROM chunks GROUP BY source ORDER BY COUNT(*) DESC"
+    ).fetchall()
+    conn.close()
+
+    repos_dir = SCRIPT_DIR / config["sources"].get("repos_dir", "data/repos")
+    issues = []
+
+    # --- Index age ---
+    indexed_at = metadata.get("indexed_at", "unknown")
+    print(f"\n{'=' * 60}")
+    print(f"  Freshness Report")
+    print(f"{'=' * 60}")
+    print(f"\n  Index built:  {indexed_at}")
+
+    if indexed_at != "unknown":
+        try:
+            built = datetime.fromisoformat(indexed_at)
+            age = datetime.now(timezone.utc) - built
+            age_str = f"{age.days}d {age.seconds // 3600}h ago"
+            print(f"  Index age:    {age_str}")
+            if age.days > 7:
+                issues.append(f"Index is {age.days} days old — consider rebuilding")
+        except ValueError:
+            pass
+
+    print(f"  Total chunks: {chunk_count}")
+
+    # --- Embedding model ---
+    stored_model = metadata.get("embed_model", "not tracked")
+    stored_dims = metadata.get("embed_dimensions", "not tracked")
+    config_model = config["ollama"].get("embed_model", "unknown")
+    config_dims = config["search"].get("embed_dimensions", 0)
+
+    print(f"\n  Embed model (index):  {stored_model} ({stored_dims}d)")
+    print(f"  Embed model (config): {config_model} ({config_dims}d)")
+
+    if stored_model != "not tracked" and stored_model != config_model:
+        issues.append(
+            f"Model mismatch: index used '{stored_model}', config has '{config_model}' — full rebuild required"
+        )
+    if stored_dims != "not tracked" and str(config_dims) != stored_dims:
+        issues.append(
+            f"Dimension mismatch: index has {stored_dims}d, config has {config_dims}d — full rebuild required"
+        )
+
+    # --- Source repos ---
+    print(f"\n  {'Source':<25} {'Chunks':>7}  {'Status'}")
+    print(f"  {'-' * 25} {'-' * 7}  {'-' * 30}")
+
+    for repo in config.get("repos", []):
+        name = repo["name"]
+        source_tag = repo.get("source_tag", name)
+        count = next((c for s, c in source_counts if s == source_tag), 0)
+
+        stored_commit = metadata.get(f"repo:{name}:commit", "")
+        status_parts = []
+
+        # Resolve repo directory
+        if repo.get("path"):
+            repo_dir = Path(repo["path"])
+        elif repo.get("url"):
+            local_dir = repo.get("local_dir", name)
+            repo_dir = repos_dir / local_dir
+        else:
+            repo_dir = None
+
+        if repo_dir and repo_dir.exists():
+            try:
+                result = subprocess.run(
+                    ["git", "-C", str(repo_dir), "rev-parse", "HEAD"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if result.returncode == 0:
+                    current = result.stdout.strip()
+                    if stored_commit and current != stored_commit:
+                        status_parts.append("LOCAL CHANGED")
+                    elif stored_commit:
+                        status_parts.append("fresh")
+                    else:
+                        status_parts.append("no commit tracked")
+            except (subprocess.TimeoutExpired, OSError):
+                status_parts.append("git error")
+        elif repo_dir:
+            status_parts.append("NOT CLONED")
+            issues.append(f"Repo '{name}' not cloned: {repo_dir}")
+        else:
+            status_parts.append("no path")
+
+        if count == 0:
+            status_parts.append("0 chunks!")
+            issues.append(f"Source '{source_tag}' has 0 chunks in the index")
+
+        status = ", ".join(status_parts)
+        print(f"  {name:<25} {count:>7}  {status}")
+
+    # --- DB sources ---
+    for db_src in config.get("db_sources", []):
+        name = db_src["name"]
+        source_tag = db_src.get("source_tag", name)
+        count = next((c for s, c in source_counts if s == source_tag), 0)
+        db_file = Path(db_src["path"])
+        status = "exists" if db_file.exists() else "MISSING"
+        if count == 0:
+            status += ", 0 chunks!"
+        print(f"  {name:<25} {count:>7}  {status} (db_source)")
+
+    # --- Issues ---
+    if issues:
+        print(f"\n  Issues ({len(issues)}):")
+        for issue in issues:
+            print(f"    - {issue}")
+    else:
+        print(f"\n  No issues found.")
+
+    print(f"\n{'=' * 60}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -1255,9 +1443,10 @@ def main():
         format="%(levelname)s: %(message)s",
     )
 
+    commands = "clone, chunk, embed, rebuild, stats, verify, stale, freshness, ingest, gotcha"
     if len(sys.argv) < 2:
         print("Usage: python pipeline.py <command>")
-        print("Commands: clone, chunk, embed, rebuild, stats, verify, stale, ingest, gotcha")
+        print(f"Commands: {commands}")
         sys.exit(1)
 
     command = sys.argv[1]
@@ -1279,13 +1468,15 @@ def main():
         cmd_verify(config)
     elif command == "stale":
         cmd_stale(config)
+    elif command == "freshness":
+        cmd_freshness(config)
     elif command == "ingest":
         cmd_ingest(config)
     elif command == "gotcha":
         cmd_gotcha(config)
     else:
         log.error(f"Unknown command: {command}")
-        print("Commands: clone, chunk, embed, rebuild, stats, verify, stale, ingest, gotcha")
+        print(f"Commands: {commands}")
         sys.exit(1)
 
 
