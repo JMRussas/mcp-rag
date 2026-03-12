@@ -422,7 +422,7 @@ def create_server(config_path: Path | None = None) -> FastMCP:
                    WHERE chunks_fts MATCH ?
                    ORDER BY bm25(chunks_fts)
                    LIMIT ?""",
-                (f'"{safe_query}"', limit),
+                (safe_query, limit),
             ).fetchall()
         except sqlite3.OperationalError as e:
             log.warning(f"BM25 query failed: {e}")

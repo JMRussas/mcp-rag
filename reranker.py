@@ -15,6 +15,7 @@ import logging
 log = logging.getLogger("mcp-rag-server")
 
 _reranker = None
+_reranker_lock = __import__("threading").Lock()
 
 
 def get_reranker(config: dict):
@@ -31,20 +32,22 @@ def get_reranker(config: dict):
     """
     global _reranker
     if _reranker is None:
-        from sentence_transformers import CrossEncoder
+        with _reranker_lock:
+            if _reranker is None:
+                from sentence_transformers import CrossEncoder
 
-        reranker_config = config.get("reranker", {})
-        model_name = reranker_config.get("model", "cross-encoder/ms-marco-MiniLM-L6-v2")
-        backend = reranker_config.get("backend", "onnx")
+                reranker_config = config.get("reranker", {})
+                model_name = reranker_config.get("model", "cross-encoder/ms-marco-MiniLM-L6-v2")
+                backend = reranker_config.get("backend", "onnx")
 
-        log.info(f"Loading reranker: {model_name} (backend={backend})")
-        try:
-            _reranker = CrossEncoder(model_name, backend=backend)
-        except Exception as e:
-            # Fall back to default backend if ONNX fails
-            log.warning(f"ONNX backend failed ({e}), falling back to default backend")
-            _reranker = CrossEncoder(model_name)
-        log.info("Reranker loaded")
+                log.info(f"Loading reranker: {model_name} (backend={backend})")
+                try:
+                    _reranker = CrossEncoder(model_name, backend=backend)
+                except Exception as e:
+                    # Fall back to default backend if ONNX fails
+                    log.warning(f"ONNX backend failed ({e}), falling back to default backend")
+                    _reranker = CrossEncoder(model_name)
+                log.info("Reranker loaded")
 
     return _reranker
 
