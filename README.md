@@ -1,25 +1,24 @@
 # mcp-rag
 
+[![CI](https://github.com/JMRussas/mcp-rag/actions/workflows/ci.yml/badge.svg)](https://github.com/JMRussas/mcp-rag/actions/workflows/ci.yml)
+
 **Turn any codebase into a searchable knowledge base for AI coding assistants.**
 
-Most RAG frameworks require heavy infrastructure — vector databases, LangChain, cloud APIs. mcp-rag takes a different approach: a single Python pipeline that chunks your code, embeds it locally via [Ollama](https://ollama.com), stores everything in SQLite, and serves hybrid semantic + keyword search over the [Model Context Protocol (MCP)](https://modelcontextprotocol.io).
-
-One config file. No cloud dependencies. Works with any MCP client.
+A local code-search pipeline: language-aware chunking, Ollama embeddings, SQLite storage, and MCP tools for semantic search and exact lookup. Optional BM25/vector fusion and cross-encoder reranking extend retrieval without requiring a hosted vector database.
 
 ```
 Your Code ──→ Chunkers ──→ Ollama Embeddings ──→ SQLite + FTS5 ──→ MCP Server ──→ Claude Code
               (AST-aware)   (local, private)      (vector + text)    (search + lookup tools)
 ```
 
-## Why mcp-rag?
+## Engineering focus
 
-| | mcp-rag | LangChain / LlamaIndex | Cloud RAG (Pinecone, etc.) |
-|---|---|---|---|
-| **Dependencies** | 3 Python packages + Ollama | Dozens of packages, complex chains | Cloud account, API keys, billing |
-| **Infrastructure** | SQLite (zero config) | Requires external vector DB | Managed service |
-| **Privacy** | 100% local, nothing leaves your machine | Depends on provider choices | Data sent to cloud |
-| **MCP native** | Built as an MCP server from the ground up | Requires adapter/wrapper | Requires adapter/wrapper |
-| **Config model** | One JSON file drives everything | Code changes per project | Dashboard + code changes |
+- **Inspectable storage:** SQLite and FTS5 keep chunks, metadata, and keyword search together.
+- **Explicit retrieval modes:** semantic search by default; optional BM25 + reciprocal rank fusion via `search.hybrid`; optional local cross-encoder reranking.
+- **Source provenance:** source hashes, freshness checks, and embedding-model drift detection help identify an index that needs rebuilding.
+- **Known limits:** embeddings are loaded into memory, and confidence tiers are score heuristics rather than calibrated probabilities.
+
+See [server.py](server.py), [pipeline.py](pipeline.py), and [provenance tests](tests/test_provenance.py) for the implementation and checks.
 
 ## Quick Start
 
@@ -34,7 +33,8 @@ ollama pull nomic-embed-text
 
 # Configure — point at your codebase
 cp config.example.json config.json
-# Edit config.json: set repo paths, source tags, chunker types
+# Edit config.json: set repo paths, source tags, chunker types.
+# Remove the example db_sources entry unless you have that SQLite source.
 
 # Build the index
 python pipeline.py rebuild
@@ -101,22 +101,26 @@ from pathlib import Path
 from chunkers import register_chunker
 from chunkers.base import BaseChunker
 
+
 class RustChunker(BaseChunker):
     def chunk_directory(self, source_dir: Path, repo_config: dict) -> list[dict]:
         source_tag = repo_config.get("source_tag", "rust")
         chunks = []
         for rs_file in sorted(source_dir.rglob("*.rs")):
-            chunks.append({
-                "id": f"rust:{source_tag}:{rs_file.stem}",
-                "text": rs_file.read_text(),
-                "source": source_tag,
-                "module_path": "",
-                "type_name": "",
-                "category": "",
-                "heading": "",
-                "file_path": str(rs_file.relative_to(source_dir)),
-            })
+            chunks.append(
+                {
+                    "id": f"rust:{source_tag}:{rs_file.stem}",
+                    "text": rs_file.read_text(),
+                    "source": source_tag,
+                    "module_path": "",
+                    "type_name": "",
+                    "category": "",
+                    "heading": "",
+                    "file_path": str(rs_file.relative_to(source_dir)),
+                }
+            )
         return chunks
+
 
 register_chunker("rust", RustChunker)
 ```
@@ -200,7 +204,7 @@ mcp-rag/
 │   ├── digest.py          Nested module definition parser
 │   ├── markdown.py        Heading-based markdown splitter
 │   └── code.py            Generic whole-file chunker
-├── tests/                 Pytest suite (61 tests)
+├── tests/                 Pytest suite
 ├── examples/              Ready-to-use configs (Python, C#, docs)
 ├── Dockerfile             Container build
 ├── docker-compose.yml     One-command setup with Ollama
@@ -209,14 +213,14 @@ mcp-rag/
 
 ## Development
 
-Built as part of a local AI development infrastructure, extracted and open-sourced as a standalone tool. Development uses a structured review process — each commit addresses specific findings from code review passes (SQL injection safety, transaction correctness, logging hygiene). 61 tests with CI running lint ([ruff](https://github.com/astral-sh/ruff)) and pytest on every push.
+Built as part of a local AI development infrastructure, extracted and open-sourced as a standalone tool. Development uses a structured review process — each commit addresses specific findings from code review passes (SQL injection safety, transaction correctness, logging hygiene). CI runs lint ([ruff](https://github.com/astral-sh/ruff)) and pytest on pushes and pull requests.
 
 See [commit history](https://github.com/JMRussas/mcp-rag/commits/main) for the review-driven development trail.
 
 ## Limitations
 
-- All embeddings loaded into memory at startup — practical up to ~50k chunks (~150 MB)
-- Full rebuild each time (no incremental re-indexing)
+- All embeddings are loaded into memory at startup; capacity depends on chunk count and embedding dimensions
+- File-source updates require rebuilding; `ingest` appends new queued chunk IDs, not a general incremental file synchronizer
 - Chunkers use AST/regex parsing, not full language servers
 - Single Ollama instance for embedding
 
@@ -226,4 +230,15 @@ Python 3.11+ · [FastMCP](https://github.com/jlowin/fastmcp) · SQLite + FTS5 ·
 
 ## License
 
-MIT
+[AGPL-3.0-or-later](LICENSE)
+
+## Run the checks
+
+```bash
+pip install -r requirements.txt ruff==0.16.9
+ruff check .
+ruff format --check .
+python -m pytest tests/ -q
+```
+
+The MCP dependency is constrained to v1 because the server imports its FastMCP API. Migrating to MCP v2 requires an explicit compatibility change. Tests use fixtures and mocks; they do not establish retrieval quality on an unseen codebase.

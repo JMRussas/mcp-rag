@@ -89,8 +89,8 @@ def _rrf_confidence_thresholds(k: int = 60) -> tuple[float, float]:
     RRF score = 1/(k + rank + 1).  Top-1 ≈ 1/(k+1), Top-3 ≈ 1/(k+4).
     High = top-3 results, Medium = top-10.
     """
-    high = 1.0 / (k + 4)   # rank 3
-    med = 1.0 / (k + 11)   # rank 10
+    high = 1.0 / (k + 4)  # rank 3
+    med = 1.0 / (k + 11)  # rank 10
     return high, med
 
 
@@ -353,16 +353,20 @@ def create_server(config_path: Path | None = None) -> FastMCP:
             similarities[~filter_mask] = -1
 
         top_indices = np.argsort(similarities)[::-1][:depth]
-        vector_ranked = [
-            chunk_ids[idx] for idx in top_indices
-            if similarities[idx] >= min_score
-        ]
+        vector_ranked = [chunk_ids[idx] for idx in top_indices if similarities[idx] >= min_score]
 
         # --- BM25 retrieval (hybrid mode) ---
         if hybrid_enabled:
             bm25_ranked = _bm25_retrieve(
-                conn, query, depth * 2, source_filter, module_filter,
-                chunk_ids, chunk_sources, chunk_modules, filter_mask,
+                conn,
+                query,
+                depth * 2,
+                source_filter,
+                module_filter,
+                chunk_ids,
+                chunk_sources,
+                chunk_modules,
+                filter_mask,
             )
             # Fuse with RRF
             fused = _rrf_fuse([vector_ranked, bm25_ranked], k=rrf_k)
@@ -370,8 +374,9 @@ def create_server(config_path: Path | None = None) -> FastMCP:
             result_scores = {doc_id: score for doc_id, score in fused[:depth]}
         else:
             ranked_ids = vector_ranked[:top_k]
-            result_scores = {chunk_ids[idx]: float(similarities[idx]) for idx in top_indices
-                             if chunk_ids[idx] in ranked_ids}
+            result_scores = {
+                chunk_ids[idx]: float(similarities[idx]) for idx in top_indices if chunk_ids[idx] in ranked_ids
+            }
 
         if not ranked_ids:
             return format_results([])
@@ -389,6 +394,7 @@ def create_server(config_path: Path | None = None) -> FastMCP:
         if reranker_enabled and len(results) > 1:
             try:
                 from reranker import rerank
+
                 results = rerank(query, results, config)
                 # Reassign scores based on reranked order
                 result_scores = {r["id"]: 1.0 / (i + 1) for i, r in enumerate(results)}
@@ -409,10 +415,7 @@ def create_server(config_path: Path | None = None) -> FastMCP:
         else:
             tier_high, tier_med = confidence_high, confidence_medium
 
-        tiers = {
-            r["id"]: _confidence_tier(final_scores.get(r["id"], 0.0), tier_high, tier_med)
-            for r in results
-        }
+        tiers = {r["id"]: _confidence_tier(final_scores.get(r["id"], 0.0), tier_high, tier_med) for r in results}
 
         # Filter low-confidence results if configured
         if exclude_low:

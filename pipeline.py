@@ -72,7 +72,9 @@ def _validate_config(config: dict):
     has_db_sources = isinstance(config.get("db_sources"), list) and len(config["db_sources"]) > 0
 
     if not has_repos and not has_db_sources:
-        raise ConfigError("config.json needs at least one of 'repos' (non-empty list) or 'db_sources' (non-empty list).")
+        raise ConfigError(
+            "config.json needs at least one of 'repos' (non-empty list) or 'db_sources' (non-empty list)."
+        )
 
     for i, repo in enumerate(config.get("repos", [])):
         if "name" not in repo:
@@ -783,7 +785,17 @@ async def _verify_async(config: dict):
 
     # Column check
     cols = {r[1] for r in conn.execute("PRAGMA table_info(chunks)").fetchall()}
-    expected_cols = {"id", "text", "source", "module_path", "type_name", "category", "heading", "file_path", "embedding"}
+    expected_cols = {
+        "id",
+        "text",
+        "source",
+        "module_path",
+        "type_name",
+        "category",
+        "heading",
+        "file_path",
+        "embedding",
+    }
     missing_cols = expected_cols - cols
     check("chunks columns complete", not missing_cols, f"missing: {missing_cols}" if missing_cols else "")
 
@@ -827,9 +839,7 @@ async def _verify_async(config: dict):
     log.info("")
     log.info("FTS5:")
     try:
-        fts_count = conn.execute(
-            "SELECT COUNT(*) FROM chunks_fts"
-        ).fetchone()[0]
+        fts_count = conn.execute("SELECT COUNT(*) FROM chunks_fts").fetchone()[0]
         check("FTS5 populated", fts_count > 0, f"{fts_count} entries")
         check("FTS5 matches chunks", fts_count == total, f"FTS5={fts_count} vs chunks={total}")
     except sqlite3.OperationalError as e:
@@ -900,16 +910,18 @@ async def _verify_async(config: dict):
                             results = [r for r in results if r.get("source") == tq["expect_source"]]
 
                         check(
-                            f"search \"{query_text}\"",
+                            f'search "{query_text}"',
                             len(results) >= min_results,
                             f"{len(results)} results (need {min_results}), "
-                            f"top: {results[0]['id']} ({results[0]['score']:.3f})" if results else "no results",
+                            f"top: {results[0]['id']} ({results[0]['score']:.3f})"
+                            if results
+                            else "no results",
                         )
                     except httpx.ConnectError:
-                        warn(f"search \"{query_text}\"", "Ollama not reachable — skipping semantic tests")
+                        warn(f'search "{query_text}"', "Ollama not reachable — skipping semantic tests")
                         ollama_available = False
                     except Exception as e:
-                        check(f"search \"{query_text}\"", False, str(e))
+                        check(f'search "{query_text}"', False, str(e))
 
                 elif "lookup" in tq:
                     # Keyword lookup test (pure SQLite, no Ollama needed)
@@ -927,7 +939,7 @@ async def _verify_async(config: dict):
                         ).fetchall()
 
                     check(
-                        f"lookup \"{name}\"",
+                        f'lookup "{name}"',
                         len(lookup_rows) >= min_results,
                         f"{len(lookup_rows)} results" + (f", first: {lookup_rows[0][0]}" if lookup_rows else ""),
                     )
@@ -936,7 +948,6 @@ async def _verify_async(config: dict):
 
     # --- Summary ---
     log.info("")
-    total_checks = passed + failed
     if failed == 0:
         log.info(f"[verify] ALL PASSED ({passed} checks, {warnings} warnings)")
     else:
@@ -1020,10 +1031,7 @@ def cmd_stale(config: dict):
             if result.returncode == 0:
                 current_commit = result.stdout.strip()
                 if current_commit != stored_commit:
-                    log.info(
-                        f"[stale] Repo '{name}': commit changed "
-                        f"({stored_commit[:7]} -> {current_commit[:7]})"
-                    )
+                    log.info(f"[stale] Repo '{name}': commit changed ({stored_commit[:7]} -> {current_commit[:7]})")
                     stale_repos.append(name)
                 else:
                     fresh_repos.append(name)
@@ -1034,12 +1042,16 @@ def cmd_stale(config: dict):
                             # Fetch remote refs without downloading objects
                             subprocess.run(
                                 ["git", "-C", str(repo_dir), "fetch", "--dry-run"],
-                                capture_output=True, text=True, timeout=30,
+                                capture_output=True,
+                                text=True,
+                                timeout=30,
                             )
                             # Compare local HEAD to remote tracking branch
                             remote_result = subprocess.run(
                                 ["git", "-C", str(repo_dir), "rev-parse", "@{u}"],
-                                capture_output=True, text=True, timeout=10,
+                                capture_output=True,
+                                text=True,
+                                timeout=10,
                             )
                             if remote_result.returncode == 0:
                                 remote_head = remote_result.stdout.strip()
@@ -1055,9 +1067,7 @@ def cmd_stale(config: dict):
 
     # --- File-level check (source hash comparison) ---
     log.info("[stale] Checking file hashes...")
-    rows = conn.execute(
-        "SELECT DISTINCT file_path, source, source_hash FROM chunks WHERE source_hash != ''"
-    ).fetchall()
+    rows = conn.execute("SELECT DISTINCT file_path, source, source_hash FROM chunks WHERE source_hash != ''").fetchall()
 
     for row in rows:
         fp = row["file_path"]
@@ -1200,7 +1210,9 @@ def cmd_freshness(config: dict):
             try:
                 result = subprocess.run(
                     ["git", "-C", str(repo_dir), "rev-parse", "HEAD"],
-                    capture_output=True, text=True, timeout=10,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
                 )
                 if result.returncode == 0:
                     current = result.stdout.strip()
@@ -1242,7 +1254,7 @@ def cmd_freshness(config: dict):
         for issue in issues:
             print(f"    - {issue}")
     else:
-        print(f"\n  No issues found.")
+        print("\n  No issues found.")
 
     print(f"\n{'=' * 60}\n")
 
@@ -1313,10 +1325,7 @@ async def _ingest_async(config: dict):
 
     # Deduplicate against existing DB
     conn = sqlite3.connect(str(db_path), isolation_level=None)
-    existing_ids = {
-        r[0]
-        for r in conn.execute("SELECT id FROM chunks").fetchall()
-    }
+    existing_ids = {r[0] for r in conn.execute("SELECT id FROM chunks").fetchall()}
     new_chunks = [c for c in chunks if c["id"] not in existing_ids]
     if not new_chunks:
         log.info(f"[ingest] All {len(chunks)} entries already exist in DB.")

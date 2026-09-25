@@ -10,7 +10,6 @@ import struct
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # _build_source_base_dirs / _resolve_source_path
 # ---------------------------------------------------------------------------
@@ -38,7 +37,9 @@ def test_build_base_dirs_with_source_subdir(tmp_path):
     """source_subdir is appended to the base directory."""
     from pipeline import _build_source_base_dirs
 
-    repos = [{"name": "big-repo", "path": str(tmp_path / "mono"), "source_tag": "sub", "source_subdir": "packages/core"}]
+    repos = [
+        {"name": "big-repo", "path": str(tmp_path / "mono"), "source_tag": "sub", "source_subdir": "packages/core"}
+    ]
     dirs = _build_source_base_dirs(repos, tmp_path / "repos")
     assert dirs["sub"] == tmp_path / "mono" / "packages" / "core"
 
@@ -190,8 +191,14 @@ def _build_test_db(db_path, chunks, metadata=None):
             """INSERT INTO chunks
                (id, text, source, file_path, source_hash, embedding)
                VALUES (?, ?, ?, ?, ?, ?)""",
-            (chunk["id"], chunk.get("text", ""), chunk["source"],
-             chunk.get("file_path", ""), chunk.get("source_hash", ""), blob),
+            (
+                chunk["id"],
+                chunk.get("text", ""),
+                chunk["source"],
+                chunk.get("file_path", ""),
+                chunk.get("source_hash", ""),
+                blob,
+            ),
         )
 
     if metadata:
@@ -219,9 +226,12 @@ def test_stale_detects_changed_file(tmp_path):
     # Build DB with the original hash
     db_path = tmp_path / "data" / "rag.db"
     db_path.parent.mkdir(parents=True)
-    _build_test_db(db_path, [
-        {"id": "test:1", "source": "test", "file_path": "file.py", "source_hash": original_hash},
-    ])
+    _build_test_db(
+        db_path,
+        [
+            {"id": "test:1", "source": "test", "file_path": "file.py", "source_hash": original_hash},
+        ],
+    )
 
     # Modify the file
     (src / "file.py").write_bytes(b"modified content")
@@ -233,6 +243,7 @@ def test_stale_detects_changed_file(tmp_path):
     }
 
     import pipeline
+
     original_script_dir = pipeline.SCRIPT_DIR
     pipeline.SCRIPT_DIR = tmp_path
     try:
@@ -255,9 +266,12 @@ def test_stale_fresh_when_unchanged(tmp_path):
 
     db_path = tmp_path / "data" / "rag.db"
     db_path.parent.mkdir(parents=True)
-    _build_test_db(db_path, [
-        {"id": "test:1", "source": "test", "file_path": "file.py", "source_hash": file_hash},
-    ])
+    _build_test_db(
+        db_path,
+        [
+            {"id": "test:1", "source": "test", "file_path": "file.py", "source_hash": file_hash},
+        ],
+    )
 
     config = {
         "database": {"path": str(db_path)},
@@ -266,6 +280,7 @@ def test_stale_fresh_when_unchanged(tmp_path):
     }
 
     import pipeline
+
     original_script_dir = pipeline.SCRIPT_DIR
     pipeline.SCRIPT_DIR = tmp_path
     try:
@@ -284,9 +299,12 @@ def test_stale_detects_missing_file(tmp_path):
 
     db_path = tmp_path / "data" / "rag.db"
     db_path.parent.mkdir(parents=True)
-    _build_test_db(db_path, [
-        {"id": "test:1", "source": "test", "file_path": "deleted.py", "source_hash": "abc123"},
-    ])
+    _build_test_db(
+        db_path,
+        [
+            {"id": "test:1", "source": "test", "file_path": "deleted.py", "source_hash": "abc123"},
+        ],
+    )
 
     config = {
         "database": {"path": str(db_path)},
@@ -295,6 +313,7 @@ def test_stale_detects_missing_file(tmp_path):
     }
 
     import pipeline
+
     original_script_dir = pipeline.SCRIPT_DIR
     pipeline.SCRIPT_DIR = tmp_path
     try:
@@ -344,7 +363,7 @@ def test_ingest_skips_malformed_lines(tmp_path):
     ingest_path = tmp_path / "ingest.jsonl"
     lines = [
         '{"id": "good:1", "text": "valid entry", "source": "test"}',
-        'not valid json',
+        "not valid json",
         '{"id": "bad:1", "text": "missing source field"}',
         '{"id": "good:2", "text": "another valid", "source": "test"}',
     ]
